@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -24,6 +25,8 @@ BCACHEFS = Path(os.environ.get("BCACHEFS_BINARY", ROOT / "target/release/bcachef
 GIB = 1024**3
 IMAGE_BYTES = int(os.environ.get("BCACHEFS_MIGRATE_IMAGE_BYTES", 12 * GIB))
 MIGRATE_TIMEOUT_SECONDS = 5 * 60
+CANDIDATE_MOUNT_TIMEOUT_SECONDS = 30
+
 FORBIDDEN_ALLOCATOR_OUTPUT = (
     "no_buckets_found",
     "Allocator stuck",
@@ -37,7 +40,12 @@ RESERVATION_FIELDS = (
     "reservation_usable_full_bucket_count",
     "reservation_usable_full_bucket_bytes",
     "reservation_bucket_alignment_loss_bytes",
+    "reservation_default_superblock_protected_bytes",
+    "reservation_device_tail_bytes",
 )
+ALTERNATE_SUPERBLOCK_RE = re.compile(r"mount -t bcachefs -o ro,sb=(\d+)")
+
+
 
 TOP_LEVEL_RW_MOUNT_OPTIONS = "rw,noatime,subvolid=5"
 TOP_LEVEL_RO_MOUNT_OPTIONS = "ro,noatime,subvolid=5"
@@ -143,6 +151,8 @@ class BtrfsImage:
     mountpoint: Path
     mounted: bool = False
     loop_device: Path | None = None
+    candidate_mountpoint: Path | None = None
+    candidate_process: subprocess.Popen[str] | None = None
 
     @classmethod
     def create(cls, workspace: Path) -> "BtrfsImage":
@@ -210,6 +220,7 @@ class BtrfsImage:
 
     def mount(self, options: str = TOP_LEVEL_RW_MOUNT_OPTIONS) -> None:
         assert not self.mounted
+        assert self.candidate_mountpoint is None
         option_set = set(options.split(","))
         assert len(option_set & {"ro", "rw"}) == 1, options
         self._attach_loop()
@@ -295,15 +306,92 @@ class BtrfsImage:
         assert re.search(r"(?im)^Data, single:", filesystem_df), filesystem_df
         assert re.search(r"(?im)^Metadata, DUP:", filesystem_df), filesystem_df
         assert re.search(r"(?im)^System, DUP:", filesystem_df), filesystem_df
-
     def check_readonly(self) -> None:
         self.unmount()
-        _run(["btrfs", "check", "--readonly", self.image], timeout=MIGRATE_TIMEOUT_SECONDS)
+        assert self.loop_device is not None
+        _run(
+            ["btrfs", "check", "--readonly", self.loop_device],
+            timeout=MIGRATE_TIMEOUT_SECONDS,
+        )
+
+    def mount_bcachefs_candidate_readonly(self, alternate_sb: int) -> Path:
+        assert self.loop_device is not None
+        assert self.candidate_mountpoint is None
+        assert self.candidate_process is None
+        self.unmount()
+        mountpoint = self.image.parent / "candidate"
+        mountpoint.mkdir()
+        process = subprocess.Popen(
+            [
+                BCACHEFS,
+                "fusemount",
+                "-f",
+                "-o",
+                f"ro,sb={alternate_sb}",
+                self.loop_device,
+                mountpoint,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        self.candidate_process = process
+        for _ in range(CANDIDATE_MOUNT_TIMEOUT_SECONDS * 10):
+            if process.poll() is not None:
+                self.candidate_process = None
+                mountpoint.rmdir()
+                pytest.fail(
+                    f"bcachefs candidate mount exited before readiness: {process.returncode}"
+                )
+            try:
+                options = _mount_options(mountpoint)
+            except AssertionError:
+                time.sleep(0.1)
+                continue
+            assert "ro" in options, options
+            self.candidate_mountpoint = mountpoint
+            return mountpoint
+        process.terminate()
+        process.wait(timeout=CANDIDATE_MOUNT_TIMEOUT_SECONDS)
+        self.candidate_process = None
+        mountpoint.rmdir()
+        pytest.fail("bcachefs candidate mount did not become ready")
+
+    def _try_unmount_bcachefs_candidate(self) -> str | None:
+        if self.candidate_mountpoint is None:
+            return None
+        mountpoint = self.candidate_mountpoint
+        result = _run(["umount", mountpoint], check=False)
+        if result.returncode:
+            return f"candidate umount failed ({result.returncode}): {result.stdout}"
+        self.candidate_mountpoint = None
+        assert self.candidate_process is not None
+        try:
+            self.candidate_process.wait(timeout=CANDIDATE_MOUNT_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            self.candidate_process.terminate()
+            self.candidate_process.wait(timeout=CANDIDATE_MOUNT_TIMEOUT_SECONDS)
+            return "candidate FUSE process did not exit after unmount"
+        finally:
+            self.candidate_process = None
+        try:
+            mountpoint.rmdir()
+        except OSError as error:
+            return f"candidate mountpoint cleanup failed: {error}"
+        return None
+
+    def unmount_bcachefs_candidate(self) -> None:
+        if error := self._try_unmount_bcachefs_candidate():
+            pytest.fail(error)
 
     def cleanup(self) -> None:
         errors = [
             error
-            for error in (self._try_unmount(), self._try_detach_loop())
+            for error in (
+                self._try_unmount_bcachefs_candidate(),
+                self._try_unmount(),
+                self._try_detach_loop(),
+            )
             if error
         ]
         try:
@@ -370,6 +458,62 @@ def _migrate(image: BtrfsImage, *args: str) -> subprocess.CompletedProcess[str]:
         pytest.fail(
             f"bcachefs migrate exceeded {MIGRATE_TIMEOUT_SECONDS}s: {error.cmd}"
         )
+
+
+@dataclass(frozen=True)
+class ReservationState:
+    inode: int
+    size: int
+    allocated_bytes: int
+
+
+def _manifest(root: Path) -> dict[str, str]:
+    manifest = {
+        path.relative_to(root).as_posix(): _sha256(path)
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+    assert manifest, root
+    return manifest
+
+
+def _assert_manifest(root: Path, manifest: dict[str, str]) -> None:
+    for relative_path, expected_digest in manifest.items():
+        path = root / relative_path
+        assert path.is_file(), path
+        assert _sha256(path) == expected_digest, path
+
+
+def _reservation_state(image: BtrfsImage) -> ReservationState:
+    reservation = image.mountpoint / "bcachefs"
+    stat = reservation.stat()
+    assert reservation.is_file(), reservation
+    assert stat.st_size > 0, stat
+    allocated_bytes = stat.st_blocks * 512
+    assert allocated_bytes > 0, stat
+    return ReservationState(stat.st_ino, stat.st_size, allocated_bytes)
+
+
+def _alternate_superblock(output: str) -> int:
+    match = ALTERNATE_SUPERBLOCK_RE.search(output)
+    assert match, output
+    return int(match.group(1))
+
+
+def _assert_successful_migration(
+    result: subprocess.CompletedProcess[str],
+) -> tuple[dict[str, int], int]:
+    assert result.returncode == 0, result.stdout
+    assert "MIGRATE_RESULT eligible=yes" in result.stdout, result.stdout
+    assert re.search(r"(?m)^MIGRATE_RESERVATION ", result.stdout), result.stdout
+    _assert_bounded_allocator_result(result)
+    return _reservation_metrics(result.stdout), _alternate_superblock(result.stdout)
+
+
+def _assert_device_stats_zero(image: BtrfsImage) -> None:
+    stats = _run(["btrfs", "device", "stats", image.mountpoint]).stdout
+    values = [int(value) for value in re.findall(r"(?m)\s(\d+)$", stats)]
+    assert values and not any(values), stats
 
 
 def test_a_supported_btrfs_no_change_is_eligible(btrfs_image: BtrfsImage) -> None:
@@ -440,3 +584,76 @@ def test_stress_migrate_is_bounded_and_avoids_allocator_path_leaks(
         metrics = _reservation_metrics(result.stdout)
         assert metrics["reservation_usable_full_bucket_bytes"] > 0, result.stdout
         assert "MIGRATE_RESULT eligible=yes" in result.stdout, result.stdout
+
+
+def test_retry_existing_migration_reservation_is_bounded_and_valid(
+    btrfs_image: BtrfsImage,
+) -> None:
+    _fragment_available_space(btrfs_image)
+    _write_tree(btrfs_image, directories=64, files_per_directory=32)
+    btrfs_image.sync()
+    manifest = _manifest(btrfs_image.mountpoint)
+
+    first_metrics, first_sb = _assert_successful_migration(_migrate(btrfs_image, "-f"))
+    first_reservation = _reservation_state(btrfs_image)
+
+    first_candidate = btrfs_image.mount_bcachefs_candidate_readonly(first_sb)
+    try:
+        assert (first_candidate / "old_migrated_filesystem").exists()
+        _assert_manifest(first_candidate, manifest)
+    finally:
+        btrfs_image.unmount_bcachefs_candidate()
+
+    btrfs_image.mount_readwrite_top_level()
+    btrfs_image.assert_writable_top_level()
+    assert (btrfs_image.mountpoint / "bcachefs").is_file()
+    _assert_manifest(btrfs_image.mountpoint, manifest)
+
+    second_metrics, second_sb = _assert_successful_migration(
+        _migrate(btrfs_image, "-F", "-f")
+    )
+    second_reservation = _reservation_state(btrfs_image)
+    assert second_reservation.inode == first_reservation.inode
+    assert second_reservation.size == first_reservation.size
+    assert second_reservation.allocated_bytes >= first_reservation.allocated_bytes
+
+    second_candidate = btrfs_image.mount_bcachefs_candidate_readonly(second_sb)
+    try:
+        assert (second_candidate / "old_migrated_filesystem").exists()
+        _assert_manifest(second_candidate, manifest)
+    finally:
+        btrfs_image.unmount_bcachefs_candidate()
+
+    btrfs_image.mount("ro,rescue=nologreplay,noatime,subvolid=5")
+    btrfs_image.assert_readonly_top_level()
+    assert (btrfs_image.mountpoint / "bcachefs").is_file()
+    _assert_manifest(btrfs_image.mountpoint, manifest)
+    _assert_device_stats_zero(btrfs_image)
+    btrfs_image.check_readonly()
+
+    print(
+        "MIGRATE_RETRY_FIRST "
+        f"sb={first_sb} inode={first_reservation.inode} "
+        f"size={first_reservation.size} allocated={first_reservation.allocated_bytes} "
+        f"raw_extents={first_metrics['reservation_raw_extent_count']} "
+        f"raw_bytes={first_metrics['reservation_raw_bytes']} "
+        f"bucket_bytes={first_metrics['reservation_bucket_size_bytes']} "
+        f"full_buckets={first_metrics['reservation_usable_full_bucket_count']} "
+        f"full_bytes={first_metrics['reservation_usable_full_bucket_bytes']} "
+        f"alignment_loss={first_metrics['reservation_bucket_alignment_loss_bytes']} "
+        f"superblock_protected={first_metrics['reservation_default_superblock_protected_bytes']} "
+        f"device_tail={first_metrics['reservation_device_tail_bytes']}"
+    )
+    print(
+        "MIGRATE_RETRY_SECOND "
+        f"sb={second_sb} inode={second_reservation.inode} "
+        f"size={second_reservation.size} allocated={second_reservation.allocated_bytes} "
+        f"raw_extents={second_metrics['reservation_raw_extent_count']} "
+        f"raw_bytes={second_metrics['reservation_raw_bytes']} "
+        f"bucket_bytes={second_metrics['reservation_bucket_size_bytes']} "
+        f"full_buckets={second_metrics['reservation_usable_full_bucket_count']} "
+        f"full_bytes={second_metrics['reservation_usable_full_bucket_bytes']} "
+        f"alignment_loss={second_metrics['reservation_bucket_alignment_loss_bytes']} "
+        f"superblock_protected={second_metrics['reservation_default_superblock_protected_bytes']} "
+        f"device_tail={second_metrics['reservation_device_tail_bytes']}"
+    )
