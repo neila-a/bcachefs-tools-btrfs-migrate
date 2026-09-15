@@ -594,6 +594,10 @@ bucket_alloc_scan(struct btree_trans *trans, struct alloc_request *req,
 				POS(ca->dev_idx, pos),
 				BTREE_ITER_committed | BTREE_ITER_nopreserve);
 
+	if (unlikely(bucket_alloc_scan_should_inject_restart()))
+		return ERR_PTR(btree_trans_restart(trans,
+				BCH_ERR_transaction_restart_fault_inject));
+
 	while (1) {
 		if (!forwards && pos < min.offset)
 			return NULL;
