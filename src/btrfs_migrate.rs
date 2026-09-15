@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use std::cmp::min;
+use std::cmp::{min, Ordering};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -799,6 +799,35 @@ fn kernel_path(bytes: &[u8]) -> Result<PathBuf> {
     Ok(PathBuf::from(OsString::from_vec(bytes[..end].to_vec())))
 }
 
+/// Btrfs tree keys are ordered lexicographically as one 136-bit key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BtrfsTreeKey {
+    objectid: u64,
+    ty: u32,
+    offset: u64,
+}
+
+impl Ord for BtrfsTreeKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.objectid
+            .cmp(&other.objectid)
+            .then(self.ty.cmp(&other.ty))
+            .then(self.offset.cmp(&other.offset))
+    }
+}
+
+impl PartialOrd for BtrfsTreeKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl BtrfsTreeKey {
+    fn in_range(self, min: Self, max: Self) -> bool {
+        min <= self && self <= max
+    }
+}
+
 #[derive(Debug)]
 struct SearchRecord {
     objectid: u64,
@@ -829,6 +858,17 @@ fn read_tree_items(
     key.max_type = max_type;
 
     loop {
+        let request_min = BtrfsTreeKey {
+            objectid: key.min_objectid,
+            ty: key.min_type,
+            offset: key.min_offset,
+        };
+        let request_max = BtrfsTreeKey {
+            objectid: key.max_objectid,
+            ty: key.max_type,
+            offset: key.max_offset,
+        };
+
         let mut args =
             crate::wrappers::ioctl::IoctlBuf::<bch_bindgen::c::btrfs_ioctl_search_args_v2>::new::<
                 u8,
@@ -904,11 +944,12 @@ fn read_tree_items(
                     cursor
                 );
             }
-            if objectid < key.min_objectid
-                || objectid > key.max_objectid
-                || type_ < key.min_type
-                || type_ > key.max_type
-            {
+            let returned_key = BtrfsTreeKey {
+                objectid,
+                ty: type_,
+                offset,
+            };
+            if !returned_key.in_range(request_min, request_max) {
                 bail!(
                     "Btrfs migration preflight failed: {} returned a record outside the search key",
                     tree_name
@@ -959,9 +1000,21 @@ fn read_tree_items(
     Ok(records)
 }
 
-#[cfg(test)]
 fn is_user_subvolume_root_objectid(objectid: u64) -> bool {
     (BTRFS_FIRST_FREE_OBJECTID..=BTRFS_LAST_FREE_OBJECTID).contains(&objectid)
+}
+
+fn count_user_subvolume_roots(records: &[SearchRecord]) -> usize {
+    let mut objectids = std::collections::HashSet::new();
+    for record in records {
+        if record.type_ != BTRFS_ROOT_ITEM_KEY as u32
+            || !is_user_subvolume_root_objectid(record.objectid)
+        {
+            continue;
+        }
+        objectids.insert(record.objectid);
+    }
+    objectids.len()
 }
 
 fn read_subvolume_count(fd: RawFd) -> Result<usize> {
@@ -974,13 +1027,14 @@ fn read_subvolume_count(fd: RawFd) -> Result<usize> {
         BTRFS_ROOT_ITEM_KEY as u32,
         "Root Tree",
     )?;
-    if !records.is_empty() {
+    let subvolume_count = count_user_subvolume_roots(&records);
+    if subvolume_count != 0 {
         bail!(
             "Btrfs migration unsupported: Root Tree contains {} child subvolume/snapshot root(s)",
-            records.len()
+            subvolume_count
         );
     }
-    Ok(0)
+    Ok(subvolume_count)
 }
 
 fn parse_chunk_search_record(record: &SearchRecord) -> Result<ChunkMap> {
@@ -1375,5 +1429,134 @@ mod tests {
         assert!(!is_user_subvolume_root_objectid(BTRFS_FS_TREE_OBJECTID));
         assert!(!is_user_subvolume_root_objectid((-9i64) as u64));
         assert!(!is_user_subvolume_root_objectid((-255i64) as u64));
+    }
+
+    const ROOT_BACKREF_KEY: u32 = BTRFS_ROOT_ITEM_KEY as u32 + 12;
+    const ROOT_REF_KEY: u32 = BTRFS_ROOT_ITEM_KEY as u32 + 24;
+
+    fn root_search_bounds() -> (BtrfsTreeKey, BtrfsTreeKey) {
+        (
+            BtrfsTreeKey {
+                objectid: BTRFS_FIRST_FREE_OBJECTID,
+                ty: BTRFS_ROOT_ITEM_KEY as u32,
+                offset: 0,
+            },
+            BtrfsTreeKey {
+                objectid: BTRFS_LAST_FREE_OBJECTID,
+                ty: BTRFS_ROOT_ITEM_KEY as u32,
+                offset: u64::MAX,
+            },
+        )
+    }
+
+    fn root_record(objectid: u64, type_: u32) -> SearchRecord {
+        SearchRecord {
+            objectid,
+            offset: 0,
+            type_,
+            payload: vec![0xff],
+        }
+    }
+
+    #[test]
+    fn root_search_min_key_is_in_composite_range() {
+        let (min, max) = root_search_bounds();
+        assert!(BtrfsTreeKey {
+            objectid: BTRFS_FIRST_FREE_OBJECTID,
+            ty: BTRFS_ROOT_ITEM_KEY as u32,
+            offset: 0,
+        }
+        .in_range(min, max));
+    }
+
+    #[test]
+    fn root_backref_at_first_objectid_is_in_composite_range() {
+        let (min, max) = root_search_bounds();
+        assert!(BtrfsTreeKey {
+            objectid: BTRFS_FIRST_FREE_OBJECTID,
+            ty: ROOT_BACKREF_KEY,
+            offset: 5,
+        }
+        .in_range(min, max));
+    }
+
+    #[test]
+    fn higher_objectid_dominates_key_type() {
+        let (min, max) = root_search_bounds();
+        assert!(BtrfsTreeKey {
+            objectid: BTRFS_FIRST_FREE_OBJECTID + 1,
+            ty: 0,
+            offset: 0,
+        }
+        .in_range(min, max));
+    }
+
+    #[test]
+    fn objectid_below_min_is_out_of_composite_range() {
+        let (min, max) = root_search_bounds();
+        assert!(!BtrfsTreeKey {
+            objectid: BTRFS_FIRST_FREE_OBJECTID - 1,
+            ty: u32::MAX,
+            offset: u64::MAX,
+        }
+        .in_range(min, max));
+    }
+
+    #[test]
+    fn root_search_max_key_is_in_composite_range() {
+        let (min, max) = root_search_bounds();
+        assert!(BtrfsTreeKey {
+            objectid: BTRFS_LAST_FREE_OBJECTID,
+            ty: BTRFS_ROOT_ITEM_KEY as u32,
+            offset: u64::MAX,
+        }
+        .in_range(min, max));
+    }
+
+    #[test]
+    fn higher_type_at_max_objectid_is_out_of_composite_range() {
+        let (min, max) = root_search_bounds();
+        assert!(!BtrfsTreeKey {
+            objectid: BTRFS_LAST_FREE_OBJECTID,
+            ty: ROOT_BACKREF_KEY,
+            offset: 0,
+        }
+        .in_range(min, max));
+    }
+
+    #[test]
+    fn data_reloc_objectid_is_outside_user_root_interval() {
+        let (min, max) = root_search_bounds();
+        assert!(!BtrfsTreeKey {
+            objectid: (-9i64) as u64,
+            ty: BTRFS_ROOT_ITEM_KEY as u32,
+            offset: 0,
+        }
+        .in_range(min, max));
+    }
+
+    #[test]
+    fn multiple_objectids_is_outside_user_root_interval() {
+        let (min, max) = root_search_bounds();
+        assert!(!BtrfsTreeKey {
+            objectid: (-255i64) as u64,
+            ty: BTRFS_ROOT_ITEM_KEY as u32,
+            offset: 0,
+        }
+        .in_range(min, max));
+    }
+
+    #[test]
+    fn root_tree_count_ignores_non_root_items_and_special_roots() {
+        let records = [
+            root_record(BTRFS_FIRST_FREE_OBJECTID, BTRFS_ROOT_ITEM_KEY as u32),
+            root_record(BTRFS_FIRST_FREE_OBJECTID, ROOT_BACKREF_KEY),
+            root_record(BTRFS_FIRST_FREE_OBJECTID, ROOT_REF_KEY),
+            root_record(BTRFS_FIRST_FREE_OBJECTID, BTRFS_ROOT_ITEM_KEY as u32),
+            root_record((-9i64) as u64, BTRFS_ROOT_ITEM_KEY as u32),
+            root_record((-255i64) as u64, BTRFS_ROOT_ITEM_KEY as u32),
+        ];
+
+        assert_eq!(count_user_subvolume_roots(&records), 1);
     }
 }
