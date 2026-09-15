@@ -1234,18 +1234,20 @@ fn migrate_fs(
     println!("fsck complete");
 
     println!(
-        "To mount the new filesystem, run\n\
-         \x20 mount -t bcachefs -o sb={sb} {dev} dir\n\
+        "To verify the new filesystem, mount it read-only with\n\
+         \x20 mount -t bcachefs -o ro,sb={sb} {dev} dir\n\
          \n\
-         After verifying that the new filesystem is correct, to create a\n\
-         superblock at the default offset and finish the migration run\n\
+         After verifying that the new filesystem is correct, unmount it\n\
+         and finish the migration by running\n\
          \x20 bcachefs migrate-superblock -d {dev} -o {sb}\n\
+         \n\
+         The new filesystem can then be mounted normally with\n\
+         \x20 mount -t bcachefs {dev} dir\n\
          \n\
          The new filesystem will have a file at /old_migrated_filesystem\n\
          referencing all disk space that might be used by the existing\n\
-         filesystem. That file can be deleted once the old filesystem is\n\
-         no longer needed (and should be deleted prior to running\n\
-         bcachefs migrate-superblock)",
+         filesystem. Once the old filesystem is no longer needed, that file\n\
+         can be deleted from the new filesystem.",
         sb = sb_offset_val,
         dev = dev_path,
     );
