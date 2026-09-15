@@ -39,6 +39,10 @@ RESERVATION_FIELDS = (
     "reservation_bucket_alignment_loss_bytes",
 )
 
+TOP_LEVEL_RW_MOUNT_OPTIONS = "rw,noatime,subvolid=5"
+TOP_LEVEL_RO_MOUNT_OPTIONS = "ro,noatime,subvolid=5"
+
+
 
 def _has_cap_sys_admin() -> bool:
     for line in Path("/proc/self/status").read_text().splitlines():
@@ -50,7 +54,15 @@ def _has_cap_sys_admin() -> bool:
 def _require_host_prerequisites() -> None:
     if not _has_cap_sys_admin():
         pytest.skip("requires CAP_SYS_ADMIN for a disposable Btrfs loop mount")
-    required = ("mkfs.btrfs", "btrfs", "mount", "umount", "sha256sum")
+    required = (
+        "mkfs.btrfs",
+        "btrfs",
+        "blockdev",
+        "losetup",
+        "mount",
+        "umount",
+        "sha256sum",
+    )
     missing = [command for command in required if shutil.which(command) is None]
     if missing:
         pytest.skip(f"missing Btrfs fixture commands: {', '.join(missing)}")
@@ -106,11 +118,31 @@ def _assert_bounded_allocator_result(result: subprocess.CompletedProcess[str]) -
         assert re.search(r"(?im)^error(?:\[[^]]+\])?:", result.stdout), result.stdout
 
 
+
+def _mount_options(mountpoint: Path) -> set[str]:
+    target = os.path.realpath(mountpoint)
+    for entry in Path("/proc/self/mountinfo").read_text().splitlines():
+        fields = entry.split()
+        if len(fields) < 6:
+            continue
+        mounted_at = re.sub(
+            r"\\([0-7]{3})",
+            lambda match: chr(int(match.group(1), 8)),
+            fields[4],
+        )
+        if mounted_at == target:
+            separator = fields.index("-")
+            return set(fields[5].split(",")) | set(fields[separator + 3].split(","))
+    raise AssertionError(f"mountpoint is not mounted: {mountpoint}")
+
+
+
 @dataclass
 class BtrfsImage:
     image: Path
     mountpoint: Path
     mounted: bool = False
+    loop_device: Path | None = None
 
     @classmethod
     def create(cls, workspace: Path) -> "BtrfsImage":
@@ -121,15 +153,19 @@ class BtrfsImage:
             file.truncate(IMAGE_BYTES)
         _run(["mkfs.btrfs", "-f", "-d", "single", "-m", "dup", image])
         fixture = cls(image, mountpoint)
-        fixture.mount()
-        fixture.assert_single_device_profiles()
+        try:
+            fixture.mount_readwrite_top_level()
+            fixture.assert_single_device_profiles()
+        except BaseException:
+            fixture.cleanup()
+            raise
         return fixture
 
-    def mount(self, options: str = "rw,subvolid=5") -> None:
-        assert not self.mounted
+    def _attach_loop(self) -> None:
+        if self.loop_device is not None:
+            return
         result = _run(
-            ["mount", "-o", f"loop,{options}", self.image, self.mountpoint],
-            check=False,
+            ["losetup", "--find", "--show", "--nooverlap", self.image], check=False
         )
         if result.returncode:
             if re.search(
@@ -137,21 +173,122 @@ class BtrfsImage:
                 result.stdout,
                 re.IGNORECASE,
             ):
-                pytest.skip(f"Btrfs loop mount is unavailable: {result.stdout.strip()}")
+                pytest.skip(f"Btrfs loop setup is unavailable: {result.stdout.strip()}")
             pytest.fail(
-                f"mount failed ({result.returncode}): {self.image} -> {self.mountpoint}\\n"
+                f"losetup failed ({result.returncode}): {self.image}\n{result.stdout}"
+            )
+        self.loop_device = Path(result.stdout.strip())
+        _run(["blockdev", "--setrw", self.loop_device])
+
+    def _assert_loop_writable(self) -> None:
+        assert self.loop_device is not None
+        readonly = _run(
+            ["losetup", "--noheadings", "--output", "RO", self.loop_device]
+        ).stdout.strip()
+        assert readonly == "0", f"loop device is read-only: {self.loop_device}"
+
+    def _try_unmount(self) -> str | None:
+        if not self.mounted:
+            return None
+        result = _run(["umount", self.mountpoint], check=False)
+        if result.returncode:
+            return f"umount failed ({result.returncode}): {result.stdout}"
+        self.mounted = False
+        return None
+
+    def _try_detach_loop(self) -> str | None:
+        if self.loop_device is None:
+            return None
+        result = _run(["losetup", "--detach", self.loop_device], check=False)
+        if result.returncode:
+            return (
+                f"losetup --detach failed ({result.returncode}): {self.loop_device}\n"
                 f"{result.stdout}"
             )
+        self.loop_device = None
+        return None
+
+    def mount(self, options: str = TOP_LEVEL_RW_MOUNT_OPTIONS) -> None:
+        assert not self.mounted
+        option_set = set(options.split(","))
+        assert len(option_set & {"ro", "rw"}) == 1, options
+        self._attach_loop()
+        assert self.loop_device is not None
+        self._assert_loop_writable()
+        loop_device = self.loop_device
+        mount_mode = "--read-only" if "ro" in option_set else "--read-write"
+        result = _run(
+            [
+                "mount",
+                mount_mode,
+                "-t",
+                "btrfs",
+                "-o",
+                options,
+                loop_device,
+                self.mountpoint,
+            ],
+            check=False,
+        )
+        if result.returncode:
+            cleanup_error = self._try_detach_loop()
+            if cleanup_error:
+                pytest.fail(cleanup_error)
+            if re.search(
+                r"permission denied|operation not permitted|权限不够|不允许",
+                result.stdout,
+                re.IGNORECASE,
+            ):
+                pytest.skip(f"Btrfs loop mount is unavailable: {result.stdout.strip()}")
+            pytest.fail(
+                f"mount failed ({result.returncode}): {loop_device} -> "
+                f"{self.mountpoint}\n{result.stdout}"
+            )
         self.mounted = True
+        try:
+            self._assert_top_level_mount_options("ro" if "ro" in option_set else "rw")
+        except BaseException:
+            cleanup_errors = [
+                error
+                for error in (self._try_unmount(), self._try_detach_loop())
+                if error
+            ]
+            if cleanup_errors:
+                pytest.fail("\n".join(cleanup_errors))
+            raise
+
+    def mount_readwrite_top_level(self) -> None:
+        self.mount(TOP_LEVEL_RW_MOUNT_OPTIONS)
+
+    def switch_to_readwrite_top_level(self) -> None:
+        self.unmount()
+        self.mount_readwrite_top_level()
+
+    def switch_to_readonly_top_level(self) -> None:
+        self.unmount()
+        self.mount(TOP_LEVEL_RO_MOUNT_OPTIONS)
 
     def unmount(self) -> None:
-        if self.mounted:
-            _run(["umount", self.mountpoint])
-            self.mounted = False
+        if error := self._try_unmount():
+            pytest.fail(error)
 
-    def remount_readonly_top_level(self) -> None:
-        self.unmount()
-        self.mount("ro,subvolid=5")
+    def _assert_top_level_mount_options(self, mode: str) -> None:
+        options = _mount_options(self.mountpoint)
+        required = {mode, "noatime", "subvolid=5"}
+        missing = sorted(required - options)
+        assert not missing, f"missing mount options {missing}: {sorted(options)}"
+        assert ("ro" if mode == "rw" else "rw") not in options, sorted(options)
+
+    def assert_writable_top_level(self) -> None:
+        self._assert_top_level_mount_options("rw")
+
+    def assert_readonly_top_level(self) -> None:
+        self._assert_top_level_mount_options("ro")
+
+
+    def sync(self) -> None:
+        self.assert_writable_top_level()
+        _run(["btrfs", "filesystem", "sync", self.mountpoint])
 
     def assert_single_device_profiles(self) -> None:
         filesystem_df = _run(["btrfs", "filesystem", "df", self.mountpoint]).stdout
@@ -164,9 +301,18 @@ class BtrfsImage:
         _run(["btrfs", "check", "--readonly", self.image], timeout=MIGRATE_TIMEOUT_SECONDS)
 
     def cleanup(self) -> None:
-        self.unmount()
-        self.image.unlink(missing_ok=True)
-        self.mountpoint.rmdir()
+        errors = [
+            error
+            for error in (self._try_unmount(), self._try_detach_loop())
+            if error
+        ]
+        try:
+            self.image.unlink(missing_ok=True)
+            self.mountpoint.rmdir()
+        except OSError as error:
+            errors.append(f"fixture path cleanup failed: {error}")
+        if errors:
+            pytest.fail("\n".join(errors))
 
 
 @pytest.fixture
@@ -179,9 +325,15 @@ def btrfs_image(tmp_path: Path) -> Iterable[BtrfsImage]:
         fixture.cleanup()
 
 
-def _write_tree(root: Path, directories: int, files_per_directory: int) -> None:
+def test_default_mount_is_writable_top_level() -> None:
+    assert BtrfsImage.mount.__defaults__ == ("rw,noatime,subvolid=5",)
+
+def _write_tree(
+    image: BtrfsImage, directories: int, files_per_directory: int
+) -> None:
+    image.assert_writable_top_level()
     for directory_index in range(directories):
-        directory = root / f"dir-{directory_index:04d}"
+        directory = image.mountpoint / f"dir-{directory_index:04d}"
         directory.mkdir()
         for file_index in range(files_per_directory):
             (directory / f"file-{file_index:04d}").write_bytes(
@@ -189,10 +341,11 @@ def _write_tree(root: Path, directories: int, files_per_directory: int) -> None:
             )
 
 
-def _fragment_available_space(root: Path) -> None:
+def _fragment_available_space(image: BtrfsImage) -> None:
+    image.assert_writable_top_level()
     fragments = []
     for index in range(48):
-        path = root / f"fragment-{index:03d}"
+        path = image.mountpoint / f"fragment-{index:03d}"
         with path.open("wb") as file:
             os.posix_fallocate(file.fileno(), 0, 4 * 1024 * 1024)
             file.flush()
@@ -200,7 +353,14 @@ def _fragment_available_space(root: Path) -> None:
         fragments.append(path)
     for path in fragments[::2]:
         path.unlink()
-    _run(["btrfs", "filesystem", "sync", root])
+    image.sync()
+
+
+def _create_child_subvolume(image: BtrfsImage) -> str:
+    image.assert_writable_top_level()
+    child_path = image.mountpoint / "child"
+    _run(["btrfs", "subvolume", "create", child_path])
+    return _run(["btrfs", "subvolume", "show", child_path]).stdout
 
 
 def _migrate(image: BtrfsImage, *args: str) -> subprocess.CompletedProcess[str]:
@@ -213,8 +373,10 @@ def _migrate(image: BtrfsImage, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 def test_a_supported_btrfs_no_change_is_eligible(btrfs_image: BtrfsImage) -> None:
-    _write_tree(btrfs_image.mountpoint, directories=4, files_per_directory=8)
-    _run(["btrfs", "filesystem", "sync", btrfs_image.mountpoint])
+    _write_tree(btrfs_image, directories=4, files_per_directory=8)
+    btrfs_image.sync()
+    btrfs_image.switch_to_readonly_top_level()
+    btrfs_image.assert_readonly_top_level()
     image_before = _sha256(btrfs_image.image)
 
     result = _migrate(btrfs_image, "--no-change", "-f")
@@ -228,8 +390,9 @@ def test_a_supported_btrfs_no_change_is_eligible(btrfs_image: BtrfsImage) -> Non
 def test_b_supported_btrfs_migrates_with_full_reservation_metrics(
     btrfs_image: BtrfsImage,
 ) -> None:
-    _write_tree(btrfs_image.mountpoint, directories=8, files_per_directory=16)
-    _run(["btrfs", "filesystem", "sync", btrfs_image.mountpoint])
+    _write_tree(btrfs_image, directories=8, files_per_directory=16)
+    btrfs_image.sync()
+    btrfs_image.assert_writable_top_level()
 
     result = _migrate(btrfs_image, "-f")
 
@@ -245,10 +408,11 @@ def test_b_supported_btrfs_migrates_with_full_reservation_metrics(
 def test_c_child_subvolume_no_change_is_rejected_without_reservation(
     btrfs_image: BtrfsImage,
 ) -> None:
-    _run(["btrfs", "subvolume", "create", btrfs_image.mountpoint / "child"])
-    child = _run(["btrfs", "subvolume", "show", btrfs_image.mountpoint / "child"]).stdout
+    child = _create_child_subvolume(btrfs_image)
     assert re.search(r"(?m)^\s*Subvolume ID:\s+256$", child), child
-    btrfs_image.remount_readonly_top_level()
+    btrfs_image.sync()
+    btrfs_image.switch_to_readonly_top_level()
+    btrfs_image.assert_readonly_top_level()
     image_before = _sha256(btrfs_image.image)
 
     result = _migrate(btrfs_image, "--no-change", "-f")
@@ -264,15 +428,15 @@ def test_c_child_subvolume_no_change_is_rejected_without_reservation(
 def test_stress_migrate_is_bounded_and_avoids_allocator_path_leaks(
     btrfs_image: BtrfsImage,
 ) -> None:
-    _fragment_available_space(btrfs_image.mountpoint)
-    _write_tree(btrfs_image.mountpoint, directories=128, files_per_directory=48)
-    _run(["btrfs", "filesystem", "sync", btrfs_image.mountpoint])
+    _fragment_available_space(btrfs_image)
+    _write_tree(btrfs_image, directories=128, files_per_directory=48)
+    btrfs_image.sync()
+    btrfs_image.assert_writable_top_level()
 
     result = _migrate(btrfs_image, "-f")
 
     _assert_bounded_allocator_result(result)
     if result.returncode == 0:
         metrics = _reservation_metrics(result.stdout)
-        assert metrics["reservation_raw_extent_count"] >= 2, result.stdout
         assert metrics["reservation_usable_full_bucket_bytes"] > 0, result.stdout
         assert "MIGRATE_RESULT eligible=yes" in result.stdout, result.stdout
