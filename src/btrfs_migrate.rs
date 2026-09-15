@@ -402,6 +402,8 @@ const BTRFS_ROOT_TREE_OBJECTID: u64 =
     bch_bindgen::c::BCH_BTRFS_ROOT_TREE_OBJECTID as u64;
 const BTRFS_FIRST_FREE_OBJECTID: u64 =
     bch_bindgen::c::BCH_BTRFS_FIRST_FREE_OBJECTID as u64;
+const BTRFS_LAST_FREE_OBJECTID: u64 =
+    bch_bindgen::c::BCH_BTRFS_LAST_FREE_OBJECTID as u64;
 const BTRFS_CHUNK_TREE_OBJECTID: u64 =
     bch_bindgen::c::BCH_BTRFS_CHUNK_TREE_OBJECTID as u64;
 const BTRFS_FIRST_CHUNK_TREE_OBJECTID: u64 =
@@ -957,12 +959,17 @@ fn read_tree_items(
     Ok(records)
 }
 
+#[cfg(test)]
+fn is_user_subvolume_root_objectid(objectid: u64) -> bool {
+    (BTRFS_FIRST_FREE_OBJECTID..=BTRFS_LAST_FREE_OBJECTID).contains(&objectid)
+}
+
 fn read_subvolume_count(fd: RawFd) -> Result<usize> {
     let records = read_tree_items(
         fd,
         BTRFS_ROOT_TREE_OBJECTID,
         BTRFS_FIRST_FREE_OBJECTID,
-        u64::MAX,
+        BTRFS_LAST_FREE_OBJECTID,
         BTRFS_ROOT_ITEM_KEY as u32,
         BTRFS_ROOT_ITEM_KEY as u32,
         "Root Tree",
@@ -1359,5 +1366,14 @@ mod tests {
         assert!(validate_incompat_features(1u64 << 63).is_err());
         assert!(validate_incompat_features(BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS).is_err());
         assert!(validate_incompat_features(BTRFS_FEATURE_INCOMPAT_NO_HOLES).is_ok());
+    }
+    #[test]
+    fn classifies_allocatable_subvolume_root_objectids() {
+        assert!(is_user_subvolume_root_objectid(256));
+        assert!(is_user_subvolume_root_objectid(257));
+        assert!(is_user_subvolume_root_objectid(BTRFS_LAST_FREE_OBJECTID));
+        assert!(!is_user_subvolume_root_objectid(BTRFS_FS_TREE_OBJECTID));
+        assert!(!is_user_subvolume_root_objectid((-9i64) as u64));
+        assert!(!is_user_subvolume_root_objectid((-255i64) as u64));
     }
 }
