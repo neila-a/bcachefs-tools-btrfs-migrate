@@ -82,19 +82,12 @@ fn fiemap_iter(fd: BorrowedFd<'_>, mapper: &ExtentMapper) -> Result<Vec<CRange>>
             );
         }
 
-        for segment in mapper
-            .map_physical(extent.fe_physical, extent.fe_length)
-            .map_err(|e| anyhow!("Unable to map metadata file extent: {}", e))?
-        {
-            let end = segment
-                .physical
-                .checked_add(segment.len)
-                .ok_or_else(|| anyhow!("metadata extent raw range overflows"))?;
-            ranges.push(CRange {
-                start: segment.physical,
-                end,
-            });
-        }
+        map_logical_extent_to_raw(
+            &mut ranges,
+            mapper,
+            extent.fe_physical,
+            extent.fe_length,
+        )?;
     }
 
     ranges_sort_merge(&mut ranges);
@@ -109,6 +102,193 @@ fn fiemap_iter(fd: BorrowedFd<'_>, mapper: &ExtentMapper) -> Result<Vec<CRange>>
 struct CRange {
     start: u64,
     end:   u64,
+}
+
+fn map_logical_extent_to_raw(
+    ranges: &mut Vec<CRange>,
+    mapper: &ExtentMapper,
+    logical: u64,
+    length: u64,
+) -> Result<()> {
+    for segment in mapper
+        .map_physical(logical, length)
+        .map_err(|e| anyhow!("Unable to map metadata file extent: {}", e))?
+    {
+        let end = segment
+            .physical
+            .checked_add(segment.len)
+            .ok_or_else(|| anyhow!("metadata extent raw range overflows"))?;
+        ranges.push(CRange {
+            start: segment.physical,
+            end,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReservationGeometry {
+    device_bytes: u64,
+    bucket_bytes: u64,
+    default_superblock_end: u64,
+}
+
+fn reservation_geometry(
+    device_bytes: u64,
+    bucket_bytes: u64,
+    superblock_size_sectors: u64,
+) -> Result<ReservationGeometry> {
+    if bucket_bytes == 0 {
+        bail!("reservation bucket size cannot be zero");
+    }
+    let default_superblock_end = (c::BCH_SB_SECTOR as u64)
+        .checked_add(
+            superblock_size_sectors
+                .checked_mul(2)
+                .ok_or_else(|| anyhow!("default superblock range overflows"))?,
+        )
+        .and_then(|sectors| sectors.checked_shl(9))
+        .ok_or_else(|| anyhow!("default superblock range overflows"))?;
+    Ok(ReservationGeometry {
+        device_bytes,
+        bucket_bytes,
+        default_superblock_end,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReservationCapacity {
+    raw_extent_count: u64,
+    raw_bytes: u64,
+    bucket_size_bytes: u64,
+    default_superblock_protected_bytes: u64,
+    device_tail_bytes: u64,
+    bucket_alignment_loss_bytes: u64,
+    usable_full_bucket_count: u64,
+    usable_full_bucket_bytes: u64,
+}
+
+fn usable_full_bucket_ranges(
+    extents: &[CRange],
+    geometry: ReservationGeometry,
+) -> Result<Vec<CRange>> {
+    if geometry.bucket_bytes == 0 {
+        bail!("reservation bucket size cannot be zero");
+    }
+
+    let protected_end = geometry
+        .default_superblock_end
+        .min(geometry.device_bytes);
+    let mut usable = Vec::with_capacity(extents.len());
+    for range in extents {
+        if range.end < range.start {
+            bail!("reservation raw range is reversed");
+        }
+        let start = range.start.max(protected_end).min(geometry.device_bytes);
+        let end = range.end.min(geometry.device_bytes);
+        if start >= end {
+            continue;
+        }
+
+        let full_start = start
+            .div_ceil(geometry.bucket_bytes)
+            .checked_mul(geometry.bucket_bytes)
+            .ok_or_else(|| anyhow!("reservation bucket alignment overflows"))?;
+        let full_end = (end / geometry.bucket_bytes) * geometry.bucket_bytes;
+        if full_start < full_end {
+            usable.push(CRange {
+                start: full_start,
+                end: full_end,
+            });
+        }
+    }
+    Ok(usable)
+}
+
+fn reservation_capacity(
+    extents: &[CRange],
+    geometry: ReservationGeometry,
+) -> Result<ReservationCapacity> {
+    let usable = usable_full_bucket_ranges(extents, geometry)?;
+    let protected_end = geometry
+        .default_superblock_end
+        .min(geometry.device_bytes);
+    let mut raw_bytes = 0u64;
+    let mut device_covered_bytes = 0u64;
+    let mut default_superblock_protected_bytes = 0u64;
+    for range in extents {
+        let range_bytes = range
+            .end
+            .checked_sub(range.start)
+            .ok_or_else(|| anyhow!("reservation raw range is reversed"))?;
+        raw_bytes = raw_bytes
+            .checked_add(range_bytes)
+            .ok_or_else(|| anyhow!("reservation raw byte count overflows"))?;
+
+        let device_start = range.start.min(geometry.device_bytes);
+        let device_end = range.end.min(geometry.device_bytes);
+        device_covered_bytes = device_covered_bytes
+            .checked_add(device_end.saturating_sub(device_start))
+            .ok_or_else(|| anyhow!("reservation device byte count overflows"))?;
+
+        let protected_start = range.start.min(protected_end);
+        let protected_end_for_range = range.end.min(protected_end);
+        default_superblock_protected_bytes = default_superblock_protected_bytes
+            .checked_add(protected_end_for_range.saturating_sub(protected_start))
+            .ok_or_else(|| anyhow!("reservation protected byte count overflows"))?;
+    }
+
+    let usable_full_bucket_bytes = usable.iter().try_fold(0u64, |bytes, range| {
+        bytes
+            .checked_add(range.end - range.start)
+            .ok_or_else(|| anyhow!("reservation usable bucket byte count overflows"))
+    })?;
+    let usable_full_bucket_count = usable_full_bucket_bytes / geometry.bucket_bytes;
+    let device_tail_bytes = raw_bytes
+        .checked_sub(device_covered_bytes)
+        .ok_or_else(|| anyhow!("reservation device coverage exceeds raw bytes"))?;
+    let bucket_alignment_loss_bytes = device_covered_bytes
+        .checked_sub(default_superblock_protected_bytes)
+        .and_then(|bytes| bytes.checked_sub(usable_full_bucket_bytes))
+        .ok_or_else(|| anyhow!("reservation usable bucket bytes exceed raw coverage"))?;
+
+    Ok(ReservationCapacity {
+        raw_extent_count: u64::try_from(extents.len())
+            .map_err(|_| anyhow!("reservation raw extent count overflows"))?,
+        raw_bytes,
+        bucket_size_bytes: geometry.bucket_bytes,
+        default_superblock_protected_bytes,
+        device_tail_bytes,
+        bucket_alignment_loss_bytes,
+        usable_full_bucket_count,
+        usable_full_bucket_bytes,
+    })
+}
+
+fn ensure_usable_reservation_capacity(capacity: &ReservationCapacity) -> Result<()> {
+    if capacity.usable_full_bucket_bytes == 0 {
+        bail!(
+            "Btrfs migration reservation has no full usable buckets (raw_extent_count={}, raw_bytes={}, bucket_alignment_loss_bytes={})",
+            capacity.raw_extent_count,
+            capacity.raw_bytes,
+            capacity.bucket_alignment_loss_bytes,
+        );
+    }
+    Ok(())
+}
+
+fn print_reservation_capacity(capacity: &ReservationCapacity) {
+    println!(
+        "MIGRATE_RESERVATION reservation_raw_extent_count={} reservation_raw_bytes={} reservation_bucket_size_bytes={} reservation_usable_full_bucket_count={} reservation_usable_full_bucket_bytes={} reservation_bucket_alignment_loss_bytes={} reservation_default_superblock_protected_bytes={} reservation_device_tail_bytes={}",
+        capacity.raw_extent_count,
+        capacity.raw_bytes,
+        capacity.bucket_size_bytes,
+        capacity.usable_full_bucket_count,
+        capacity.usable_full_bucket_bytes,
+        capacity.bucket_alignment_loss_bytes,
+        capacity.default_superblock_protected_bytes,
+        capacity.device_tail_bytes,
+    );
 }
 
 fn ranges_sort_merge(ranges: &mut Vec<CRange>) {
@@ -136,7 +316,7 @@ fn for_each_hole(ranges: &[CRange], max: u64) -> Vec<CRange> {
         if r.start > pos {
             holes.push(CRange { start: pos, end: r.start });
         }
-        pos = r.end;
+        pos = pos.max(r.end);
     }
     if pos < max {
         holes.push(CRange { start: pos, end: max });
@@ -208,24 +388,28 @@ unsafe fn mark_nouse_range(ca: *const c::bch_dev, sector_from: u64, sector_to: u
 
 /// Mark all space NOT covered by the reserved extents as nouse,
 /// plus the space for the default superblock layout.
-unsafe fn mark_unreserved_space(fs: *mut c::bch_fs, extents: &[CRange]) {
+unsafe fn mark_unreserved_space(fs: *mut c::bch_fs, extents: &[CRange]) -> Result<()> {
     let ca = (*fs).devs[0];
-    let bucket_size = (*ca).mi.bucket_size as u32;
+    let bucket_size = (*ca).mi.bucket_size as u64;
     let nbuckets = (*ca).mi.nbuckets;
 
-    // Byte-addressed max for hole iteration
-    let max_bytes = bucket_to_sector(bucket_size, nbuckets) << 9;
-
-    for hole in for_each_hole(extents, max_bytes) {
-        if hole.start == hole.end {
-            continue;
-        }
-        mark_nouse_range(ca, hole.start >> 9, hole.end.div_ceil(1 << 9));
-    }
-
-    // Also mark space for the default sb layout
+    let device_bytes = bucket_size
+        .checked_mul(nbuckets)
+        .and_then(|sectors| sectors.checked_shl(9))
+        .ok_or_else(|| anyhow!("reservation device size overflows"))?;
     let sb_size = 1u64 << (*(*ca).disk_sb.sb).layout.sb_max_size_bits;
-    mark_nouse_range(ca, 0, c::BCH_SB_SECTOR as u64 + sb_size * 2);
+    let bucket_bytes = bucket_size
+        .checked_shl(9)
+        .ok_or_else(|| anyhow!("reservation bucket size overflows"))?;
+    let geometry = reservation_geometry(device_bytes, bucket_bytes, sb_size)?;
+    let usable = usable_full_bucket_ranges(extents, geometry)?;
+
+    for hole in for_each_hole(&usable, device_bytes) {
+        if hole.start != hole.end {
+            mark_nouse_range(ca, hole.start >> 9, hole.end >> 9);
+        }
+    }
+    Ok(())
 }
 
 /// Reserve space for bcachefs metadata file, return extents, inode number, and
@@ -1122,6 +1306,15 @@ fn migrate_fs(
 
     crate::commands::format_util::check_bucket_size(&fs_opts, &c_dev);
 
+    let reservation_geometry = reservation_geometry(
+        c_dev
+            .nbuckets
+            .checked_mul(c_dev.opts.bucket_size as u64)
+            .ok_or_else(|| anyhow!("reservation device size overflows"))?,
+        c_dev.opts.bucket_size as u64,
+        format_opts.superblock_size as u64,
+    )?;
+
     // Reserve space for bcachefs metadata — grab as much as we can
     let (extents, bcachefs_inum, refreshed_mapper) = reserve_new_fs_space(
         &file_path,
@@ -1132,6 +1325,10 @@ fn migrate_fs(
         Path::new(fs_path),
         &source,
     )?;
+    let reservation_capacity = reservation_capacity(&extents, reservation_geometry)?;
+    print_reservation_capacity(&reservation_capacity);
+    ensure_usable_reservation_capacity(&reservation_capacity)?;
+
 
     // Find superblock location within reserved extents
     let (sb_offset, sb_end) = find_superblock_space(
@@ -1178,7 +1375,7 @@ fn migrate_fs(
     fs.buckets_nouse_alloc()
         .map_err(|e| anyhow!("Error allocating buckets_nouse: {}", e))?;
 
-    unsafe { mark_unreserved_space(fs.raw, &extents) };
+    unsafe { mark_unreserved_space(fs.raw, &extents) }?;
 
     fs.start()
         .map_err(|e| anyhow!("Error starting new filesystem: {}", e))?;
@@ -1501,6 +1698,44 @@ pub const CMD_MIGRATE: super::CmdDef = raw_cmd!("migrate", "Migrate existing fil
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_btrfs_mapper(chunks: Vec<crate::btrfs_migrate::ChunkMap>) -> ExtentMapper {
+        ExtentMapper::Btrfs(
+            crate::btrfs_migrate::BtrfsMapper::from_parts(
+                [0; 16],
+                1,
+                PathBuf::from("/dev/test"),
+                1024,
+                4096,
+                chunks,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn test_data_chunk(
+        logical_start: u64,
+        logical_end: u64,
+        stripe_offset: u64,
+    ) -> crate::btrfs_migrate::ChunkMap {
+        crate::btrfs_migrate::ChunkMap {
+            logical_start,
+            logical_end,
+            stripe_offset,
+            devid: 1,
+            chunk_type: BTRFS_BLOCK_GROUP_DATA_MASK,
+            num_stripes: 1,
+        }
+    }
+
+    fn map_raw_ranges(mapper: &ExtentMapper, logical_extents: &[(u64, u64)]) -> Vec<CRange> {
+        let mut ranges = Vec::new();
+        for &(logical, length) in logical_extents {
+            map_logical_extent_to_raw(&mut ranges, mapper, logical, length).unwrap();
+        }
+        ranges_sort_merge(&mut ranges);
+        ranges
+    }
+
 
     #[test]
     fn no_change_classifies_every_copy_fallback_flag() {
@@ -1539,6 +1774,126 @@ mod tests {
         assert_eq!(
             for_each_hole(&ranges, 300),
             vec![CRange { start: 200, end: 300 }],
+        );
+    }
+
+    #[test]
+    fn mapped_raw_ranges_are_sorted_after_btrfs_translation() {
+        let mapper = test_btrfs_mapper(vec![
+            test_data_chunk(0, 100, 300),
+            test_data_chunk(100, 200, 100),
+        ]);
+
+        assert_eq!(
+            map_raw_ranges(&mapper, &[(0, 100), (100, 100)]),
+            vec![
+                CRange { start: 100, end: 200 },
+                CRange { start: 300, end: 400 },
+            ],
+        );
+    }
+
+    #[test]
+    fn raw_range_normalization_merges_overlapping_and_adjacent_ranges() {
+        let mut ranges = vec![
+            CRange { start: 300, end: 400 },
+            CRange { start: 100, end: 200 },
+            CRange { start: 150, end: 250 },
+            CRange { start: 250, end: 300 },
+        ];
+
+        ranges_sort_merge(&mut ranges);
+
+        assert_eq!(ranges, vec![CRange { start: 100, end: 400 }]);
+    }
+
+    #[test]
+    fn chunk_split_raw_ranges_are_normalized_after_interleaving() {
+        let mapper = test_btrfs_mapper(vec![
+            test_data_chunk(0, 100, 400),
+            test_data_chunk(100, 200, 100),
+            test_data_chunk(200, 300, 300),
+        ]);
+
+        assert_eq!(
+            map_raw_ranges(&mapper, &[(0, 200), (200, 100)]),
+            vec![
+                CRange { start: 100, end: 200 },
+                CRange { start: 300, end: 500 },
+            ],
+        );
+    }
+
+    #[test]
+    fn normalized_raw_ranges_produce_monotonic_holes() {
+        let mapper = test_btrfs_mapper(vec![
+            test_data_chunk(0, 100, 300),
+            test_data_chunk(100, 200, 100),
+        ]);
+        let ranges = map_raw_ranges(&mapper, &[(0, 100), (100, 100)]);
+
+        assert_eq!(
+            for_each_hole(&ranges, 500),
+            vec![
+                CRange { start: 0, end: 100 },
+                CRange { start: 200, end: 300 },
+                CRange { start: 400, end: 500 },
+            ],
+        );
+    }
+
+    #[test]
+    fn reservation_capacity_counts_only_full_buckets_after_protected_region() {
+        let geometry = ReservationGeometry {
+            device_bytes: 1000,
+            bucket_bytes: 100,
+            default_superblock_end: 250,
+        };
+        let capacity = reservation_capacity(
+            &[CRange {
+                start: 150,
+                end: 650,
+            }],
+            geometry,
+        )
+        .unwrap();
+
+        assert_eq!(capacity.raw_extent_count, 1);
+        assert_eq!(capacity.raw_bytes, 500);
+        assert_eq!(capacity.default_superblock_protected_bytes, 100);
+        assert_eq!(capacity.bucket_alignment_loss_bytes, 100);
+        assert_eq!(capacity.usable_full_bucket_count, 3);
+        assert_eq!(capacity.usable_full_bucket_bytes, 300);
+    }
+
+    #[test]
+    fn reservation_capacity_rejects_without_a_full_bucket() {
+        let capacity = reservation_capacity(
+            &[CRange {
+                start: 101,
+                end: 199,
+            }],
+            ReservationGeometry {
+                device_bytes: 1000,
+                bucket_bytes: 100,
+                default_superblock_end: 0,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(capacity.usable_full_bucket_bytes, 0);
+        assert!(ensure_usable_reservation_capacity(&capacity).is_err());
+    }
+
+    #[test]
+    fn reservation_geometry_protects_default_superblock_layout() {
+        assert_eq!(
+            reservation_geometry(1 << 20, 4096, 8).unwrap(),
+            ReservationGeometry {
+                device_bytes: 1 << 20,
+                bucket_bytes: 4096,
+                default_superblock_end: (c::BCH_SB_SECTOR as u64 + 16) << 9,
+            },
         );
     }
 
