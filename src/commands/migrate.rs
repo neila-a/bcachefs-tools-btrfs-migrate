@@ -30,7 +30,9 @@ use crate::commands::opts::{bch_opt_lookup_negated, parse_opt_val};
 use crate::key::Passphrase;
 use crate::commands::format_util::{format_opts_default, DevOpts};
 use crate::util::fmt_bytes_human;
-use crate::btrfs_migrate::{preflight_source, ExtentMapper, BTRFS_BLOCK_GROUP_DATA_MASK};
+use crate::btrfs_migrate::{
+    preflight_source, BtrfsPreflight, ExtentMapper, BTRFS_BLOCK_GROUP_DATA_MASK,
+};
 use crate::wrappers::super_io;
 
 // ---- C shim declarations ----
@@ -226,7 +228,8 @@ unsafe fn mark_unreserved_space(fs: *mut c::bch_fs, extents: &[CRange]) {
     mark_nouse_range(ca, 0, c::BCH_SB_SECTOR as u64 + sb_size * 2);
 }
 
-/// Reserve space for bcachefs metadata file, return extents and inode number.
+/// Reserve space for bcachefs metadata file, return extents, inode number, and
+/// the mapper refreshed after Btrfs allocation.
 ///
 /// Nothing has been written to the block device yet, so on failure we put the
 /// host filesystem back the way we found it rather than sitting on the space.
@@ -236,8 +239,9 @@ fn reserve_new_fs_space(
     dev_size: u64,
     dev: libc::dev_t,
     force: bool,
-    mapper: &ExtentMapper,
-) -> Result<(Vec<CRange>, u64)> {
+    source_path: &Path,
+    source: &SourceInfo,
+) -> Result<(Vec<CRange>, u64, ExtentMapper)> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let mut open_opts = std::fs::OpenOptions::new();
@@ -262,12 +266,7 @@ fn reserve_new_fs_space(
     // the old filesystem's allocator would corrupt both filesystems. Roll back
     // to what we opened, not to empty.
     let orig_len = meta.len();
-
-    // A tenth of the device is a fudge factor for the new filesystem's
-    // metadata: computing what we really need means accounting for inodes,
-    // extents (which depends on fragmentation) and alloc info.
-    let extents = reserve_extents(&file, block_size, dev_size / 10, mapper);
-    if extents.is_err() {
+    let cleanup = || {
         let cleanup = if orig_len == 0 {
             fs::remove_file(file_path)
         } else {
@@ -277,18 +276,36 @@ fn reserve_new_fs_space(
         if let Err(e) = cleanup {
             eprintln!("Error releasing space in {}: {} - it is still in use", file_path, e);
         }
+    };
+
+    // A tenth of the device is a fudge factor for the new filesystem's
+    // metadata: computing what we really need means accounting for inodes,
+    // extents (which depends on fragmentation) and alloc info.
+    if let Err(error) = allocate_reservation(&file, dev_size / 10) {
+        cleanup();
+        return Err(error);
     }
 
-    Ok((extents?, bcachefs_inum))
+    let refreshed_mapper = match refresh_source_mapper(source_path, source) {
+        Ok(mapper) => mapper,
+        Err(error) => {
+            cleanup();
+            return Err(error);
+        }
+    };
+    let extents = match map_reservation_extents(&file, block_size, &refreshed_mapper) {
+        Ok(extents) => extents,
+        Err(error) => {
+            cleanup();
+            return Err(error);
+        }
+    };
+
+    Ok((extents, bcachefs_inum, refreshed_mapper))
 }
 
-/// fallocate() the reservation and return the physical extents backing it.
-fn reserve_extents(
-    file: &fs::File,
-    block_size: u32,
-    size: u64,
-    mapper: &ExtentMapper,
-) -> Result<Vec<CRange>> {
+/// Fallocate and fsync the reservation file.
+fn allocate_reservation(file: &fs::File, size: u64) -> Result<()> {
     let vfs = rustix::fs::fstatvfs(file).map_err(|e| anyhow!("fstatvfs: {}", e))?;
     let free = vfs.f_bavail.saturating_mul(vfs.f_frsize);
 
@@ -305,7 +322,15 @@ fn reserve_extents(
         })?;
 
     rustix::fs::fsync(file).map_err(|e| anyhow!("fsync: {}", e))?;
+    Ok(())
+}
 
+/// Read and map the reservation file's physical extents, then check alignment.
+fn map_reservation_extents(
+    file: &fs::File,
+    block_size: u32,
+    mapper: &ExtentMapper,
+) -> Result<Vec<CRange>> {
     let extents = fiemap_iter(file.as_fd(), mapper)?;
 
     // Check alignment
@@ -407,6 +432,105 @@ struct BtrfsSourceSummary {
     chunk_count: usize,
     subvolume_count: usize,
     data_chunk_count: usize,
+}
+
+fn refresh_source_mapper(source_path: &Path, expected: &SourceInfo) -> Result<ExtentMapper> {
+    if expected.btrfs.is_none() {
+        return Ok(expected.mapper.clone());
+    }
+
+    let refreshed = preflight_source(source_path)
+        .map_err(|error| anyhow!("Btrfs migration mapper refresh failed: {}", error))?;
+    validated_refreshed_btrfs_mapper(expected, refreshed)
+}
+
+fn validated_refreshed_btrfs_mapper(
+    expected: &SourceInfo,
+    refreshed: BtrfsPreflight,
+) -> Result<ExtentMapper> {
+    let expected_btrfs = expected
+        .btrfs
+        .as_ref()
+        .ok_or_else(|| anyhow!("Btrfs mapper refresh requires a Btrfs source"))?;
+
+    if refreshed.source_fs_dev != expected.source_fs_dev {
+        bail!(
+            "Btrfs migration unsafe: source filesystem device changed during reservation ({} -> {})",
+            expected.source_fs_dev,
+            refreshed.source_fs_dev
+        );
+    }
+    if refreshed.fsid != expected_btrfs.fsid {
+        bail!(
+            "Btrfs migration unsafe: filesystem fsid changed during reservation ({} -> {})",
+            hex_bytes(&expected_btrfs.fsid),
+            hex_bytes(&refreshed.fsid)
+        );
+    }
+    if refreshed.devid != expected_btrfs.devid {
+        bail!(
+            "Btrfs migration unsafe: raw device devid changed during reservation ({} -> {})",
+            expected_btrfs.devid,
+            refreshed.devid
+        );
+    }
+    if refreshed.num_devices != expected_btrfs.num_devices || refreshed.num_devices != 1 {
+        bail!(
+            "Btrfs migration unsafe: device count changed during reservation ({} -> {}); exactly one device is required",
+            expected_btrfs.num_devices,
+            refreshed.num_devices
+        );
+    }
+    if refreshed.raw_device_path != expected.raw_device_path {
+        bail!(
+            "Btrfs migration unsafe: raw device path changed during reservation ({} -> {})",
+            expected.raw_device_path.display(),
+            refreshed.raw_device_path.display()
+        );
+    }
+    if refreshed.raw_device_size != expected.raw_device_size {
+        bail!(
+            "Btrfs migration unsafe: raw device size changed during reservation ({} -> {})",
+            expected.raw_device_size,
+            refreshed.raw_device_size
+        );
+    }
+    if refreshed.sectorsize != expected_btrfs.sectorsize {
+        bail!(
+            "Btrfs migration unsafe: sectorsize changed during reservation ({} -> {})",
+            expected_btrfs.sectorsize,
+            refreshed.sectorsize
+        );
+    }
+    if expected_btrfs.subvolid != 5
+        || refreshed.subvolid != expected_btrfs.subvolid
+        || refreshed.subvolid != 5
+    {
+        bail!(
+            "Btrfs migration unsafe: top-level subvolid changed during reservation ({} -> {}); subvolid 5 is required",
+            expected_btrfs.subvolid,
+            refreshed.subvolid
+        );
+    }
+    if expected_btrfs.subvolume_count != 0
+        || refreshed.subvolume_count != expected_btrfs.subvolume_count
+        || refreshed.subvolume_count != 0
+    {
+        bail!(
+            "Btrfs migration unsafe: child subvolume count changed during reservation ({} -> {}); child subvolumes are not allowed",
+            expected_btrfs.subvolume_count,
+            refreshed.subvolume_count
+        );
+    }
+    if refreshed.incompat_flags != expected_btrfs.incompat_flags {
+        bail!(
+            "Btrfs migration unsafe: incompat feature set changed during reservation (0x{:x} -> 0x{:x})",
+            expected_btrfs.incompat_flags,
+            refreshed.incompat_flags
+        );
+    }
+
+    Ok(ExtentMapper::Btrfs(refreshed.mapper))
 }
 
 
@@ -999,13 +1123,14 @@ fn migrate_fs(
     crate::commands::format_util::check_bucket_size(&fs_opts, &c_dev);
 
     // Reserve space for bcachefs metadata — grab as much as we can
-    let (extents, bcachefs_inum) = reserve_new_fs_space(
+    let (extents, bcachefs_inum, refreshed_mapper) = reserve_new_fs_space(
         &file_path,
         block_size >> 9,
         dev_size,
         fs_dev,
         force,
-        &source.mapper,
+        Path::new(fs_path),
+        &source,
     )?;
 
     // Find superblock location within reserved extents
@@ -1078,7 +1203,7 @@ fn migrate_fs(
         bcachefs_inum,
         fs_dev,
         reserve_start,
-        source.mapper.clone(),
+        refreshed_mapper,
     );
     // Pre-populate with metadata reservation ranges
     for e in &extents {
@@ -1413,6 +1538,179 @@ mod tests {
             for_each_hole(&ranges, 300),
             vec![CRange { start: 200, end: 300 }],
         );
+    }
+
+    #[test]
+    fn refreshed_mapper_is_retained_for_copy_state() {
+        use crate::btrfs_migrate::{BtrfsMapper, BtrfsPreflight, ChunkMap};
+
+        fn mapper(chunks: Vec<ChunkMap>) -> BtrfsMapper {
+            BtrfsMapper::from_parts(
+                [0; 16],
+                1,
+                PathBuf::from("/dev/test"),
+                1 << 20,
+                4096,
+                chunks,
+            )
+            .unwrap()
+        }
+
+        fn source(mapper: BtrfsMapper) -> SourceInfo {
+            let data_chunk_count = mapper
+                .chunks()
+                .iter()
+                .filter(|chunk| chunk.chunk_type & BTRFS_BLOCK_GROUP_DATA_MASK != 0)
+                .count();
+            SourceInfo {
+                source_fs_dev: 42,
+                raw_device_path: mapper.device_path.clone(),
+                raw_device_size: mapper.device_size,
+                raw_alignment: 512,
+                mapper: ExtentMapper::Btrfs(mapper.clone()),
+                btrfs: Some(BtrfsSourceSummary {
+                    fsid: mapper.fsid,
+                    devid: mapper.devid,
+                    subvolid: 5,
+                    num_devices: 1,
+                    incompat_flags: 0,
+                    sectorsize: mapper.sectorsize,
+                    chunk_count: mapper.chunks().len(),
+                    subvolume_count: 0,
+                    data_chunk_count,
+                }),
+            }
+        }
+
+        fn preflight(mapper: BtrfsMapper) -> BtrfsPreflight {
+            BtrfsPreflight {
+                source_fs_dev: 42,
+                raw_device_path: mapper.device_path.clone(),
+                raw_device_size: mapper.device_size,
+                fsid: mapper.fsid,
+                devid: mapper.devid,
+                sectorsize: mapper.sectorsize,
+                num_devices: 1,
+                subvolid: 5,
+                incompat_flags: 0,
+                subvolume_count: 0,
+                mapper,
+            }
+        }
+
+        let mapper_a = mapper(vec![ChunkMap {
+            logical_start: 0,
+            logical_end: 4096,
+            stripe_offset: 4096,
+            devid: 1,
+            chunk_type: BTRFS_BLOCK_GROUP_DATA_MASK,
+            num_stripes: 1,
+        }]);
+        let mapper_b = mapper(vec![
+            ChunkMap {
+                logical_start: 0,
+                logical_end: 4096,
+                stripe_offset: 4096,
+                devid: 1,
+                chunk_type: BTRFS_BLOCK_GROUP_DATA_MASK,
+                num_stripes: 1,
+            },
+            ChunkMap {
+                logical_start: 8192,
+                logical_end: 12288,
+                stripe_offset: 32768,
+                devid: 1,
+                chunk_type: BTRFS_BLOCK_GROUP_DATA_MASK,
+                num_stripes: 1,
+            },
+        ]);
+        let expected = source(mapper_a);
+        let refreshed_mapper = validated_refreshed_btrfs_mapper(&expected, preflight(mapper_b.clone()))
+            .unwrap();
+
+        assert!(expected.mapper.map_physical(8192, 4096).is_err());
+        let state = crate::copy_fs::CopyFsState::new_migrate(7, 42, 0, refreshed_mapper);
+        assert_eq!(
+            state.mapper.map_physical(8192, 4096).unwrap(),
+            mapper_b.map_physical(8192, 4096).unwrap()
+        );
+    }
+
+    #[test]
+    fn refresh_failure_cleans_new_and_existing_reservations() {
+        use crate::btrfs_migrate::BtrfsMapper;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let directory = std::env::temp_dir().join(format!(
+            "bcachefs-migrate-refresh-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let mapper = BtrfsMapper::from_parts(
+            [0; 16],
+            1,
+            PathBuf::from("/dev/test"),
+            1 << 20,
+            4096,
+            Vec::new(),
+        )
+        .unwrap();
+        let source = SourceInfo {
+            source_fs_dev: 0,
+            raw_device_path: PathBuf::from("/dev/test"),
+            raw_device_size: 1 << 20,
+            raw_alignment: 512,
+            mapper: ExtentMapper::Btrfs(mapper),
+            btrfs: Some(BtrfsSourceSummary {
+                fsid: [0; 16],
+                devid: 1,
+                subvolid: 5,
+                num_devices: 1,
+                incompat_flags: 0,
+                sectorsize: 4096,
+                chunk_count: 0,
+                subvolume_count: 0,
+                data_chunk_count: 0,
+            }),
+        };
+        let dev = std::os::unix::fs::MetadataExt::dev(&fs::metadata(&directory).unwrap());
+
+        let new_path = directory.join("new");
+        let error = reserve_new_fs_space(
+            new_path.to_str().unwrap(),
+            8,
+            1 << 20,
+            dev,
+            false,
+            &directory,
+            &source,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Btrfs migration mapper refresh failed"));
+        assert!(!new_path.exists());
+
+        let existing_path = directory.join("existing");
+        fs::write(&existing_path, [0u8; 4096]).unwrap();
+        let error = reserve_new_fs_space(
+            existing_path.to_str().unwrap(),
+            8,
+            1 << 20,
+            dev,
+            true,
+            &directory,
+            &source,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Btrfs migration mapper refresh failed"));
+        assert_eq!(fs::metadata(&existing_path).unwrap().len(), 4096);
+
+        fs::remove_dir_all(directory).unwrap();
     }
 }
 pub const CMD_MIGRATE_SUPERBLOCK: super::CmdDef = typed_cmd!("migrate-superblock", "Move superblock to standard location", MigrateSuperblockCli, cmd_migrate_superblock);
