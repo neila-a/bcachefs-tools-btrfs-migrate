@@ -23,6 +23,7 @@ use bcachefs_kernel::errcode::{ret_to_result_void as ret_to_result, BchError, bc
 use bcachefs_kernel::fs::Fs;
 
 use crate::util::AlignedBuf;
+use crate::btrfs_migrate::{ExtentMapper, PhysicalSegment};
 
 const BCACHEFS_ROOT_INO: u64 = 4096;
 const BCACHEFS_ROOT_SUBVOL: u64 = 1;
@@ -76,6 +77,20 @@ pub enum MigrateType {
     Copy,
     Migrate,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyReason {
+    Encoded,
+    Encrypted,
+    Shared,
+    NotAligned,
+    Inline,
+    Tail,
+    Merged,
+    FutureFlags,
+    Reserved,
+    RawUnaligned,
+}
+
 
 /// State for a copy_fs operation.
 pub struct CopyFsState {
@@ -83,6 +98,7 @@ pub struct CopyFsState {
     pub bcachefs_inum:  u64,
     pub dev:            u64,
     pub reserve_start:  u64,
+    pub mapper:          ExtentMapper,
     pub extents:        Vec<(u64, u64)>,  // (start, end) byte ranges
     pub verbosity:      u32,
 
@@ -90,6 +106,22 @@ pub struct CopyFsState {
     pub total_input:    u64,
     pub total_wrote:    u64,
     pub total_linked:   u64,
+    pub total_unwritten: u64,
+    pub total_unstable: u64,
+    pub mapped_extents: u64,
+    pub mapped_segments: u64,
+    pub chunk_splits: u64,
+    pub copied_shared: u64,
+    pub copied_encoded: u64,
+    pub copied_encrypted: u64,
+    pub copied_not_aligned: u64,
+    pub copied_inline: u64,
+    pub copied_tail: u64,
+    pub copied_merged: u64,
+    pub copied_future_flags: u64,
+    pub copied_other_flag: u64,
+    pub copied_reserved: u64,
+    pub copied_raw_unaligned: u64,
 
     /// Hardlink tracking: source inode -> destination inode
     hardlinks: HashMap<u64, u64>,
@@ -102,30 +134,93 @@ impl CopyFsState {
             bcachefs_inum:  0,
             dev:            0,
             reserve_start:  0,
+            mapper:         ExtentMapper::Identity,
             extents:        Vec::new(),
             verbosity:      0,
             total_files:    0,
             total_input:    0,
             total_wrote:    0,
             total_linked:   0,
+            total_unwritten:  0,
+            total_unstable:   0,
+            mapped_extents:   0,
+            mapped_segments:  0,
+            chunk_splits:     0,
+            copied_shared:    0,
+            copied_encoded:   0,
+            copied_encrypted: 0,
+            copied_not_aligned: 0,
+            copied_inline:    0,
+            copied_tail:      0,
+            copied_merged:    0,
+            copied_future_flags: 0,
+            copied_other_flag: 0,
+            copied_reserved: 0,
+            copied_raw_unaligned: 0,
             hardlinks:      HashMap::new(),
         }
     }
 
-    pub fn new_migrate(bcachefs_inum: u64, dev: u64, reserve_start: u64) -> Self {
+    pub fn new_migrate(
+        bcachefs_inum: u64,
+        dev: u64,
+        reserve_start: u64,
+        mapper: ExtentMapper,
+    ) -> Self {
         Self {
             migrate_type:   MigrateType::Migrate,
             bcachefs_inum,
             dev,
             reserve_start,
             extents:        Vec::new(),
+            mapper,
             verbosity:      0,
             total_files:    0,
             total_input:    0,
             total_wrote:    0,
             total_linked:   0,
+            total_unwritten:  0,
+            total_unstable:   0,
+            mapped_extents:   0,
+            mapped_segments:  0,
+            chunk_splits:     0,
+            copied_shared:    0,
+            copied_encoded:   0,
+            copied_encrypted: 0,
+            copied_not_aligned: 0,
+            copied_inline:    0,
+            copied_tail:      0,
+            copied_merged:    0,
+            copied_future_flags: 0,
+            copied_other_flag: 0,
+            copied_reserved: 0,
+            copied_raw_unaligned: 0,
             hardlinks:      HashMap::new(),
         }
+    }
+    fn record_copy(&mut self, reason: CopyReason, bytes: u64) {
+        match reason {
+            CopyReason::Encoded => self.copied_encoded += bytes,
+            CopyReason::Encrypted => self.copied_encrypted += bytes,
+            CopyReason::Shared => self.copied_shared += bytes,
+            CopyReason::NotAligned => self.copied_not_aligned += bytes,
+            CopyReason::Inline => self.copied_inline += bytes,
+            CopyReason::Tail => {
+                self.copied_tail += bytes;
+                self.copied_other_flag += bytes;
+            }
+            CopyReason::Merged => {
+                self.copied_merged += bytes;
+                self.copied_other_flag += bytes;
+            }
+            CopyReason::FutureFlags => {
+                self.copied_future_flags += bytes;
+                self.copied_other_flag += bytes;
+            }
+            CopyReason::Reserved => self.copied_reserved += bytes,
+            CopyReason::RawUnaligned => self.copied_raw_unaligned += bytes,
+        }
+        self.total_wrote += bytes;
     }
 }
 
@@ -449,6 +544,20 @@ fn copy_link(
     write_data(fs, dst, 0, &buf[..padded])
 }
 
+fn file_logical_for_segment(
+    extent_file_logical: u64,
+    extent_physical: u64,
+    segment: &PhysicalSegment,
+) -> Result<u64, BchError> {
+    let offset = segment
+        .source_logical
+        .checked_sub(extent_physical)
+        .ok_or_else(|| BchError::from_raw(-libc::EINVAL))?;
+    extent_file_logical
+        .checked_add(offset)
+        .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))
+}
+
 fn link_file_data(
     fs: &Fs,
     s: &mut CopyFsState,
@@ -458,72 +567,221 @@ fn link_file_data(
     src_size: u64,
 ) -> Result<(), BchError> {
     let block_size = fs.block_bytes();
+    let mut extents = collect_fiemap(src_fd)?;
 
-    // First pass: check for unknown extents and fsync if found
-    let fm = fiemap::Fiemap::new(&src_fd);
-    for extent in fm {
-        let extent = extent.map_err(|_| BchError::from_raw(-libc::EIO))?;
-        if extent.fe_flags.contains(fiemap::FiemapExtentFlags::UNKNOWN) {
-            rustix::fs::fsync(src_fd).map_err(rustix_err)?;
-            break;
-        }
+    if extents.iter().any(|extent| {
+        extent
+            .fe_flags
+            .intersects(fiemap::FiemapExtentFlags::UNKNOWN | fiemap::FiemapExtentFlags::DELALLOC)
+    }) {
+        rustix::fs::fsync(src_fd).map_err(rustix_err)?;
+        extents = collect_fiemap(src_fd)?;
+    }
+    if extents.iter().any(|extent| {
+        extent
+            .fe_flags
+            .intersects(fiemap::FiemapExtentFlags::UNKNOWN | fiemap::FiemapExtentFlags::DELALLOC)
+    }) {
+        eprintln!(
+            "Unstable FIEMAP extent remains in {}; quiesce the source and retry",
+            src_path.to_string_lossy()
+        );
+        return Err(BchError::from_raw(-libc::EBUSY));
     }
 
-    // Second pass: link or copy extents
-    let fm = fiemap::Fiemap::new(&src_fd);
-    for extent in fm {
-        let extent = extent.map_err(|_| BchError::from_raw(-libc::EIO))?;
-
-        s.total_input += extent.fe_length;
-
-        let src_max = src_size.div_ceil(block_size) * block_size;
-        let length = std::cmp::min(extent.fe_length, src_max - extent.fe_logical);
-        let visible_len = std::cmp::min(src_size - extent.fe_logical, length);
-
-        if (extent.fe_logical & (block_size - 1)) != 0 || (length & (block_size - 1)) != 0 {
-            let msg = format!("Unaligned extent in {} - can't handle", src_path.to_string_lossy());
-            eprintln!("{}", msg);
-            return Err(BchError::from_raw(-libc::EINVAL));
-        }
-
-        let needs_copy = s.migrate_type == MigrateType::Copy
-            || extent.fe_flags.intersects(
-                fiemap::FiemapExtentFlags::UNKNOWN
-                    | fiemap::FiemapExtentFlags::ENCODED
-                    | fiemap::FiemapExtentFlags::NOT_ALIGNED
-                    | fiemap::FiemapExtentFlags::DATA_INLINE,
+    for extent in extents {
+        if extent.fe_length == 0 {
+            eprintln!(
+                "Zero-length FIEMAP extent in {}",
+                src_path.to_string_lossy()
             );
+            return Err(BchError::from_raw(-libc::EIO));
+        }
 
-        if needs_copy {
-            copy_data(fs, dst, src_fd, extent.fe_logical, extent.fe_logical + visible_len)?;
-            s.total_wrote += visible_len;
+        s.total_input = s
+            .total_input
+            .checked_add(extent.fe_length)
+            .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+
+        let src_max = src_size.div_ceil(block_size);
+        let src_max = src_max
+            .checked_mul(block_size)
+            .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+        if extent.fe_logical > src_max {
+            eprintln!(
+                "FIEMAP extent starts past EOF in {}: {} > {}",
+                src_path.to_string_lossy(),
+                extent.fe_logical,
+                src_max
+            );
+            return Err(BchError::from_raw(-libc::EIO));
+        }
+        let length = std::cmp::min(extent.fe_length, src_max - extent.fe_logical);
+        let visible_len = if extent.fe_logical >= src_size {
+            0
+        } else {
+            std::cmp::min(src_size - extent.fe_logical, length)
+        };
+
+        if visible_len == 0 {
+            continue;
+        }
+        let extent_end = extent
+            .fe_logical
+            .checked_add(visible_len)
+            .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+        if extent
+            .fe_flags
+            .contains(fiemap::FiemapExtentFlags::UNWRITTEN)
+        {
+            s.total_unwritten = s
+                .total_unwritten
+                .checked_add(visible_len)
+                .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
             continue;
         }
 
-        // If the data is in bcachefs's superblock region, copy it
-        if extent.fe_physical < s.reserve_start {
-            copy_data(fs, dst, src_fd, extent.fe_logical, extent.fe_logical + visible_len)?;
-            s.total_wrote += visible_len;
+        if let Some(reason) = extent_copy_reason(extent.fe_flags) {
+            copy_data(
+                fs,
+                dst,
+                src_fd,
+                extent.fe_logical,
+                extent_end,
+            )?;
+            s.record_copy(reason, visible_len);
             continue;
         }
 
-        if (extent.fe_physical & (block_size - 1)) != 0 {
-            let msg = format!("Unaligned extent in {} - can't handle", src_path.to_string_lossy());
-            eprintln!("{}", msg);
-            return Err(BchError::from_raw(-libc::EINVAL));
+        let segments = s
+            .mapper
+            .map_physical(extent.fe_physical, length)
+            .map_err(|error| {
+                eprintln!(
+                    "Unable to map FIEMAP logical extent in {}: {}",
+                    src_path.to_string_lossy(),
+                    error
+                );
+                BchError::from_raw(-libc::EINVAL)
+            })?;
+        if segments.is_empty() {
+            continue;
         }
+        s.mapped_extents = s
+            .mapped_extents
+            .checked_add(1)
+            .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+        s.mapped_segments = s
+            .mapped_segments
+            .checked_add(segments.len() as u64)
+            .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+        s.chunk_splits = s
+            .chunk_splits
+            .checked_add((segments.len() as u64).saturating_sub(1))
+            .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
 
-        range_add(&mut s.extents, extent.fe_physical, length);
-        link_data(fs, dst, extent.fe_logical, extent.fe_physical, length)?;
-        s.total_linked += length;
+        for segment in segments {
+            let segment_file_logical =
+                file_logical_for_segment(extent.fe_logical, extent.fe_physical, &segment)?;
+            let segment_file_end = segment_file_logical
+                .checked_add(segment.len)
+                .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+            let copy_start = std::cmp::max(segment_file_logical, extent.fe_logical);
+            let copy_end = std::cmp::min(segment_file_end, extent_end);
+            let copy_len = copy_end.saturating_sub(copy_start);
+            if copy_len == 0 {
+                continue;
+            }
+            let physical_offset = copy_start
+                .checked_sub(segment_file_logical)
+                .ok_or_else(|| BchError::from_raw(-libc::EINVAL))?;
+            let link_physical = segment
+                .physical
+                .checked_add(physical_offset)
+                .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+
+            let reason = if link_physical < s.reserve_start {
+                Some(CopyReason::Reserved)
+            } else if (copy_start | link_physical | copy_len)
+                & (block_size - 1)
+                != 0
+            {
+                Some(CopyReason::RawUnaligned)
+            } else {
+                None
+            };
+
+            if let Some(reason) = reason {
+                copy_data(fs, dst, src_fd, copy_start, copy_end)?;
+                s.record_copy(reason, copy_len);
+                continue;
+            }
+
+            range_add(&mut s.extents, link_physical, copy_len)?;
+            link_data(
+                fs,
+                dst,
+                copy_start,
+                link_physical,
+                copy_len,
+            )?;
+            s.total_linked = s
+                .total_linked
+                .checked_add(copy_len)
+                .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+        }
     }
 
     Ok(())
 }
 
+fn collect_fiemap(src_fd: BorrowedFd<'_>) -> Result<Vec<fiemap::FiemapExtent>, BchError> {
+    fiemap::Fiemap::new(src_fd)
+        .map(|extent| extent.map_err(|_| BchError::from_raw(-libc::EIO)))
+        .collect()
+}
+
+fn extent_copy_reason(flags: fiemap::FiemapExtentFlags) -> Option<CopyReason> {
+    let known = fiemap::FiemapExtentFlags::LAST
+        | fiemap::FiemapExtentFlags::UNKNOWN
+        | fiemap::FiemapExtentFlags::DELALLOC
+        | fiemap::FiemapExtentFlags::ENCODED
+        | fiemap::FiemapExtentFlags::DATA_ENCRYPTED
+        | fiemap::FiemapExtentFlags::NOT_ALIGNED
+        | fiemap::FiemapExtentFlags::DATA_INLINE
+        | fiemap::FiemapExtentFlags::DATA_TAIL
+        | fiemap::FiemapExtentFlags::UNWRITTEN
+        | fiemap::FiemapExtentFlags::MERGED
+        | fiemap::FiemapExtentFlags::SHARED;
+    if flags.contains(fiemap::FiemapExtentFlags::ENCODED) {
+        Some(CopyReason::Encoded)
+    } else if flags.contains(fiemap::FiemapExtentFlags::DATA_ENCRYPTED) {
+        Some(CopyReason::Encrypted)
+    } else if flags.contains(fiemap::FiemapExtentFlags::SHARED) {
+        Some(CopyReason::Shared)
+    } else if flags.contains(fiemap::FiemapExtentFlags::DATA_INLINE) {
+        Some(CopyReason::Inline)
+    } else if flags.contains(fiemap::FiemapExtentFlags::DATA_TAIL) {
+        Some(CopyReason::Tail)
+    } else if flags.contains(fiemap::FiemapExtentFlags::NOT_ALIGNED) {
+        Some(CopyReason::NotAligned)
+    } else if flags.contains(fiemap::FiemapExtentFlags::MERGED) {
+        Some(CopyReason::Merged)
+    } else if flags.bits() & !known.bits() != 0 {
+        Some(CopyReason::FutureFlags)
+    } else {
+        None
+    }
+}
+
+
 /// Add a range to the extents list.
-fn range_add(extents: &mut Vec<(u64, u64)>, start: u64, len: u64) {
-    extents.push((start, start + len));
+fn range_add(extents: &mut Vec<(u64, u64)>, start: u64, len: u64) -> Result<(), BchError> {
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+    extents.push((start, end));
+    Ok(())
 }
 
 /// Sort and merge overlapping ranges.
@@ -1055,6 +1313,29 @@ pub fn copy_fs(
         print_human_readable(s.total_linked);
         println!();
     }
+    println!(
+        "MIGRATE_PLAN mode=migrate total_input_bytes={} linked_bytes={} copied_bytes={} copied_shared_bytes={} copied_encoded_bytes={} copied_encrypted_bytes={} copied_inline_bytes={} copied_not_aligned_bytes={} copied_other_flag_bytes={} unwritten_hole_bytes={} unstable_extent_bytes={} mapped_extent_count={} mapped_segment_count={} chunk_split_count={} copied_tail_bytes={} copied_merged_bytes={} copied_future_flags_bytes={} copied_reserved_bytes={} copied_raw_unaligned_bytes={}",
+        s.total_input,
+        s.total_linked,
+        s.total_wrote,
+        s.copied_shared,
+        s.copied_encoded,
+        s.copied_encrypted,
+        s.copied_inline,
+        s.copied_not_aligned,
+        s.copied_other_flag,
+        s.total_unwritten,
+        s.total_unstable,
+        s.mapped_extents,
+        s.mapped_segments,
+        s.chunk_splits,
+        s.copied_tail,
+        s.copied_merged,
+        s.copied_future_flags,
+        s.copied_reserved,
+        s.copied_raw_unaligned,
+    );
+    println!("MIGRATE_RESULT eligible=yes");
 
     Ok(())
 }
@@ -1068,5 +1349,33 @@ fn print_human_readable(bytes: u64) {
         print!("{:.1} KiB", bytes as f64 / (1u64 << 10) as f64);
     } else {
         print!("{} B", bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translates_btrfs_logical_segment_to_file_offset() {
+        let segment = PhysicalSegment {
+            source_logical: 0x20_1000,
+            physical: 0x40_2000,
+            len: 0x2000,
+        };
+        assert_eq!(
+            file_logical_for_segment(0x8000, 0x20_0000, &segment).unwrap(),
+            0x9000
+        );
+    }
+
+    #[test]
+    fn rejects_segment_before_extent_mapping_origin() {
+        let segment = PhysicalSegment {
+            source_logical: 0x1fff,
+            physical: 0,
+            len: 0x1000,
+        };
+        assert!(file_logical_for_segment(0, 0x2000, &segment).is_err());
     }
 }

@@ -1,5 +1,6 @@
 mod commands;
 mod copy_fs;
+mod btrfs_migrate;
 mod degraded;
 mod device_multipath;
 mod device_scan;
