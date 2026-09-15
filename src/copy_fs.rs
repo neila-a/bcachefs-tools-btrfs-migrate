@@ -8,6 +8,7 @@
 //
 // Converted from c_src/posix_to_bcachefs.c.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -39,6 +40,165 @@ const XATTR_INDEX_ACL_ACCESS: i32 = 1;
 const XATTR_INDEX_ACL_DEFAULT: i32 = 2;
 const XATTR_INDEX_TRUSTED: i32  = 3;
 const XATTR_INDEX_SECURITY: i32 = 4;
+
+const POSIX_ACL_XATTR_VERSION: u32 = 0x0002;
+const BCH_ACL_VERSION: u32 = 0x0001;
+
+const ACL_USER_OBJ: u16 = 0x01;
+const ACL_USER: u16 = 0x02;
+const ACL_GROUP_OBJ: u16 = 0x04;
+const ACL_GROUP: u16 = 0x08;
+const ACL_MASK: u16 = 0x10;
+const ACL_OTHER: u16 = 0x20;
+const ACL_UNDEFINED_ID: u32 = 0xffff_ffff;
+
+const POSIX_ACL_XATTR_HEADER_SIZE: usize = 4;
+const POSIX_ACL_XATTR_ENTRY_SIZE: usize = 8;
+
+fn read_acl_bytes<const N: usize>(
+    value: &[u8],
+    offset: usize,
+    entry_index: usize,
+) -> anyhow::Result<[u8; N]> {
+    let end = offset
+        .checked_add(N)
+        .ok_or_else(|| anyhow::anyhow!("POSIX ACL entry {} offset overflows", entry_index))?;
+    let bytes = value.get(offset..end).ok_or_else(|| {
+        anyhow::anyhow!(
+            "POSIX ACL entry {} is truncated at byte {}",
+            entry_index,
+            offset
+        )
+    })?;
+    Ok(bytes.try_into().unwrap())
+}
+
+fn linux_posix_acl_xattr_to_bcachefs(value: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if value.len() < POSIX_ACL_XATTR_HEADER_SIZE {
+        anyhow::bail!(
+            "Linux POSIX ACL xattr is shorter than its {}-byte header ({} bytes)",
+            POSIX_ACL_XATTR_HEADER_SIZE,
+            value.len()
+        );
+    }
+
+    let version = u32::from_le_bytes(read_acl_bytes::<4>(value, 0, 0)?);
+    if version != POSIX_ACL_XATTR_VERSION {
+        anyhow::bail!(
+            "unsupported Linux POSIX ACL xattr version {}",
+            version
+        );
+    }
+
+    let payload_len = value
+        .len()
+        .checked_sub(POSIX_ACL_XATTR_HEADER_SIZE)
+        .ok_or_else(|| anyhow::anyhow!("POSIX ACL xattr header length overflows"))?;
+    if payload_len % POSIX_ACL_XATTR_ENTRY_SIZE != 0 {
+        anyhow::bail!(
+            "Linux POSIX ACL xattr payload is {} bytes, not divisible by {}",
+            payload_len,
+            POSIX_ACL_XATTR_ENTRY_SIZE
+        );
+    }
+
+    let entry_count = payload_len / POSIX_ACL_XATTR_ENTRY_SIZE;
+    let output_capacity = POSIX_ACL_XATTR_HEADER_SIZE
+        .checked_add(
+            entry_count
+                .checked_mul(POSIX_ACL_XATTR_ENTRY_SIZE)
+                .ok_or_else(|| anyhow::anyhow!("POSIX ACL output size overflows"))?,
+        )
+        .ok_or_else(|| anyhow::anyhow!("POSIX ACL output size overflows"))?;
+    let mut output = Vec::with_capacity(output_capacity);
+    output.extend_from_slice(&BCH_ACL_VERSION.to_le_bytes());
+
+    let mut offset = POSIX_ACL_XATTR_HEADER_SIZE;
+    for entry_index in 0..entry_count {
+        let tag = u16::from_le_bytes(read_acl_bytes::<2>(value, offset, entry_index)?);
+        let perm = u16::from_le_bytes(read_acl_bytes::<2>(
+            value,
+            offset
+                .checked_add(2)
+                .ok_or_else(|| anyhow::anyhow!("POSIX ACL entry {} offset overflows", entry_index))?,
+            entry_index,
+        )?);
+        let id = u32::from_le_bytes(read_acl_bytes::<4>(
+            value,
+            offset
+                .checked_add(4)
+                .ok_or_else(|| anyhow::anyhow!("POSIX ACL entry {} offset overflows", entry_index))?,
+            entry_index,
+        )?);
+
+        if perm & !0x7 != 0 {
+            anyhow::bail!(
+                "Linux POSIX ACL entry {} has invalid permissions 0x{:x}",
+                entry_index,
+                perm
+            );
+        }
+
+        let short_entry = match tag {
+            ACL_USER_OBJ | ACL_GROUP_OBJ | ACL_MASK | ACL_OTHER => true,
+            ACL_USER | ACL_GROUP => false,
+            _ => anyhow::bail!(
+                "Linux POSIX ACL entry {} has unknown tag 0x{:x}",
+                entry_index,
+                tag
+            ),
+        };
+
+        if short_entry {
+            if id != ACL_UNDEFINED_ID {
+                anyhow::bail!(
+                    "Linux POSIX ACL entry {} has concrete id {} for short tag 0x{:x}",
+                    entry_index,
+                    id,
+                    tag
+                );
+            }
+        } else if id == ACL_UNDEFINED_ID {
+            anyhow::bail!(
+                "Linux POSIX ACL entry {} has undefined id for named tag 0x{:x}",
+                entry_index,
+                tag
+            );
+        }
+
+        output.extend_from_slice(&tag.to_le_bytes());
+        output.extend_from_slice(&perm.to_le_bytes());
+        if !short_entry {
+            output.extend_from_slice(&id.to_le_bytes());
+        }
+
+        offset = offset
+            .checked_add(POSIX_ACL_XATTR_ENTRY_SIZE)
+            .ok_or_else(|| anyhow::anyhow!("POSIX ACL entry offset overflows"))?;
+    }
+
+    Ok(output)
+}
+
+fn xattr_value_for_storage<'a>(
+    xattr_type: i32,
+    value: &'a [u8],
+) -> anyhow::Result<Cow<'a, [u8]>> {
+    match xattr_type {
+        XATTR_INDEX_ACL_ACCESS | XATTR_INDEX_ACL_DEFAULT => {
+            linux_posix_acl_xattr_to_bcachefs(value).map(Cow::Owned)
+        }
+        _ => Ok(Cow::Borrowed(value)),
+    }
+}
+
+fn acl_type_name(xattr_type: i32) -> Option<&'static str> {
+    match xattr_type {
+        XATTR_INDEX_ACL_ACCESS => Some("access"),
+        XATTR_INDEX_ACL_DEFAULT => Some("default"),
+        _ => None,
+    }
+}
 
 fn mode_to_type(mode: u32) -> u8 {
     ((mode >> 12) & 15) as u8
@@ -385,10 +545,10 @@ fn xattr_resolve_name(name: &[u8]) -> Option<(i32, &[u8])> {
         Some((XATTR_INDEX_TRUSTED, rest))
     } else if let Some(rest) = name.strip_prefix(b"security.") {
         Some((XATTR_INDEX_SECURITY, rest))
-    } else if let Some(rest) = name.strip_prefix(b"system.posix_acl_access") {
-        Some((XATTR_INDEX_ACL_ACCESS, rest))
-    } else if let Some(rest) = name.strip_prefix(b"system.posix_acl_default") {
-        Some((XATTR_INDEX_ACL_DEFAULT, rest))
+    } else if name == b"system.posix_acl_access" {
+        Some((XATTR_INDEX_ACL_ACCESS, b""))
+    } else if name == b"system.posix_acl_default" {
+        Some((XATTR_INDEX_ACL_DEFAULT, b""))
     } else {
         None
     }
@@ -413,6 +573,7 @@ fn copy_xattrs(
     fs: &Fs,
     dst: &mut c::bch_inode_unpacked,
     src: &CStr,
+    display_path: &CStr,
 ) -> Result<(), BchError> {
     let mut attrs_buf = vec![0u8; 65536]; // XATTR_LIST_MAX
     let attrs_size = match rustix::fs::llistxattr(src, &mut attrs_buf) {
@@ -436,17 +597,43 @@ fn copy_xattrs(
             Some(v) => v,
             None => continue,
         };
+        let acl_kind = acl_type_name(xattr_type);
 
         let mut val_buf = vec![0u8; 65536]; // XATTR_SIZE_MAX
         let attr_cstr = CString::new(attr_name).unwrap();
         let val_size = match rustix::fs::lgetxattr(src, &attr_cstr, &mut val_buf) {
             Ok(n) => n,
-            Err(_) => continue,
+            Err(error) => {
+                if let Some(acl_kind) = acl_kind {
+                    eprintln!(
+                        "Unable to migrate POSIX {} ACL on {}: unable to read source xattr: {}",
+                        acl_kind,
+                        display_path.to_string_lossy(),
+                        error
+                    );
+                    return Err(rustix_err(error));
+                }
+                continue;
+            }
         };
 
+        let value = match xattr_value_for_storage(xattr_type, &val_buf[..val_size]) {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(acl_kind) = acl_kind {
+                    eprintln!(
+                        "Unable to migrate POSIX {} ACL on {}: {}",
+                        acl_kind,
+                        display_path.to_string_lossy(),
+                        error
+                    );
+                }
+                return Err(BchError::from_raw(-libc::EINVAL));
+            }
+        };
         let stripped_cstr = CString::new(stripped).unwrap();
 
-        btree::iter::trans_commit_do(
+        let result = btree::iter::trans_commit_do(
             fs,
             None,
             CommitOpts::new(),
@@ -456,12 +643,23 @@ fn copy_xattrs(
                     subvol_inum(dst.bi_inum),
                     dst,
                     &stripped_cstr,
-                    &val_buf[..val_size],
+                    value.as_ref(),
                     xattr_type,
                     0,
                 )
             },
-        )?;
+        );
+        if let Err(error) = result {
+            if let Some(acl_kind) = acl_kind {
+                eprintln!(
+                    "Unable to migrate POSIX {} ACL on {}: failed to store ACL: {}",
+                    acl_kind,
+                    display_path.to_string_lossy(),
+                    error
+                );
+            }
+            return Err(error);
+        }
     }
 
     Ok(())
@@ -1188,7 +1386,7 @@ fn copy_dir(
         }
 
         let name_cstr = &d.name;
-        copy_xattrs(fs, &mut inode, name_cstr)?;
+        copy_xattrs(fs, &mut inode, name_cstr, &child_path)?;
 
         match mode_to_type(d.stat.st_mode) {
             DT_DIR => {
@@ -1285,7 +1483,7 @@ pub fn copy_fs(
     copy_times(fs, &mut root_inode, &stat);
 
     let dot = CString::new(".").unwrap();
-    copy_xattrs(fs, &mut root_inode, &dot)?;
+    copy_xattrs(fs, &mut root_inode, &dot, src_path)?;
 
     let dup_fd = rustix::io::dup(src_fd).map_err(rustix_err)?;
     copy_dir(fs, s, &mut root_inode, dup_fd, src_path)?;
@@ -1377,5 +1575,173 @@ mod tests {
             len: 0x1000,
         };
         assert!(file_logical_for_segment(0, 0x2000, &segment).is_err());
+    }
+    const USER_OBJ: u16 = 0x01;
+    const USER: u16 = 0x02;
+    const GROUP_OBJ: u16 = 0x04;
+    const GROUP: u16 = 0x08;
+    const MASK: u16 = 0x10;
+    const OTHER: u16 = 0x20;
+    const UNDEFINED: u32 = 0xffff_ffff;
+
+    fn linux_acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut value = 0x0002u32.to_le_bytes().to_vec();
+        for &(tag, perm, id) in entries {
+            value.extend_from_slice(&tag.to_le_bytes());
+            value.extend_from_slice(&perm.to_le_bytes());
+            value.extend_from_slice(&id.to_le_bytes());
+        }
+        value
+    }
+
+    #[test]
+    fn converts_linux_posix_acl_fixture_exactly() {
+        let source = [
+            0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0xff, 0xff, 0xff, 0xff, 0x02,
+            0x00, 0x04, 0x00, 0x39, 0x30, 0x00, 0x00, 0x04, 0x00, 0x04, 0x00, 0xff, 0xff,
+            0xff, 0xff, 0x10, 0x00, 0x04, 0x00, 0xff, 0xff, 0xff, 0xff, 0x20, 0x00, 0x04,
+            0x00, 0xff, 0xff, 0xff, 0xff,
+        ];
+        let expected = [
+            0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x02, 0x00, 0x04, 0x00, 0x39,
+            0x30, 0x00, 0x00, 0x04, 0x00, 0x04, 0x00, 0x10, 0x00, 0x04, 0x00, 0x20, 0x00,
+            0x04, 0x00,
+        ];
+        assert_eq!(linux_posix_acl_xattr_to_bcachefs(&source).unwrap(), expected);
+    }
+
+    #[test]
+    fn converts_minimal_linux_posix_acl() {
+        let source = linux_acl(&[
+            (USER_OBJ, 6, UNDEFINED),
+            (GROUP_OBJ, 4, UNDEFINED),
+            (OTHER, 4, UNDEFINED),
+        ]);
+        let expected = [
+            0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x04, 0x00, 0x04, 0x00, 0x20, 0x00,
+            0x04, 0x00,
+        ];
+        assert_eq!(linux_posix_acl_xattr_to_bcachefs(&source).unwrap(), expected);
+    }
+
+    #[test]
+    fn converts_named_group_entry() {
+        let source = linux_acl(&[
+            (GROUP_OBJ, 4, UNDEFINED),
+            (GROUP, 4, 12345),
+            (OTHER, 4, UNDEFINED),
+        ]);
+        let expected = [
+            0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x04, 0x00, 0x08, 0x00, 0x04, 0x00, 0x39, 0x30,
+            0x00, 0x00, 0x20, 0x00, 0x04, 0x00,
+        ];
+        assert_eq!(linux_posix_acl_xattr_to_bcachefs(&source).unwrap(), expected);
+    }
+
+    #[test]
+    fn converts_access_acl_containing_mask() {
+        let source = linux_acl(&[
+            (USER_OBJ, 6, UNDEFINED),
+            (GROUP_OBJ, 4, UNDEFINED),
+            (MASK, 4, UNDEFINED),
+            (OTHER, 4, UNDEFINED),
+        ]);
+        let expected = [
+            0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x04, 0x00, 0x04, 0x00, 0x10, 0x00,
+            0x04, 0x00, 0x20, 0x00, 0x04, 0x00,
+        ];
+        assert_eq!(linux_posix_acl_xattr_to_bcachefs(&source).unwrap(), expected);
+    }
+
+    #[test]
+    fn default_acl_uses_identical_binary_conversion() {
+        let source = linux_acl(&[
+            (USER_OBJ, 6, UNDEFINED),
+            (USER, 4, 12345),
+            (GROUP_OBJ, 4, UNDEFINED),
+            (MASK, 4, UNDEFINED),
+            (OTHER, 4, UNDEFINED),
+        ]);
+        let expected = linux_posix_acl_xattr_to_bcachefs(&source).unwrap();
+        assert_eq!(
+            xattr_value_for_storage(XATTR_INDEX_ACL_DEFAULT, &source)
+                .unwrap()
+                .as_ref(),
+            expected.as_slice()
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_external_acl_version() {
+        let mut source = linux_acl(&[]);
+        source[..4].copy_from_slice(&3u32.to_le_bytes());
+        let error = linux_posix_acl_xattr_to_bcachefs(&source).unwrap_err();
+        assert!(error.to_string().contains("version"));
+    }
+
+    #[test]
+    fn rejects_acl_shorter_than_header() {
+        assert!(linux_posix_acl_xattr_to_bcachefs(&[0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn rejects_acl_payload_not_divisible_by_entry_size() {
+        assert!(linux_posix_acl_xattr_to_bcachefs(&[2, 0, 0, 0, 1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_acl_tag() {
+        assert!(linux_posix_acl_xattr_to_bcachefs(&linux_acl(&[(0x40, 4, UNDEFINED)])).is_err());
+    }
+
+    #[test]
+    fn rejects_acl_permissions_above_seven() {
+        assert!(linux_posix_acl_xattr_to_bcachefs(&linux_acl(&[(USER_OBJ, 8, UNDEFINED)])).is_err());
+    }
+
+    #[test]
+    fn rejects_named_user_with_undefined_id() {
+        assert!(linux_posix_acl_xattr_to_bcachefs(&linux_acl(&[(USER, 4, UNDEFINED)])).is_err());
+    }
+
+    #[test]
+    fn rejects_named_group_with_undefined_id() {
+        assert!(linux_posix_acl_xattr_to_bcachefs(&linux_acl(&[(GROUP, 4, UNDEFINED)])).is_err());
+    }
+
+    #[test]
+    fn rejects_short_acl_entry_with_concrete_id() {
+        assert!(linux_posix_acl_xattr_to_bcachefs(&linux_acl(&[(USER_OBJ, 4, 12345)])).is_err());
+    }
+
+    #[test]
+    fn resolves_only_exact_acl_names() {
+        assert_eq!(
+            xattr_resolve_name(b"system.posix_acl_access"),
+            Some((XATTR_INDEX_ACL_ACCESS, &[][..]))
+        );
+        assert_eq!(
+            xattr_resolve_name(b"system.posix_acl_default"),
+            Some((XATTR_INDEX_ACL_DEFAULT, &[][..]))
+        );
+        assert_eq!(
+            xattr_resolve_name(b"system.posix_acl_access.foo"),
+            None
+        );
+        assert_eq!(
+            xattr_resolve_name(b"system.posix_acl_default.foo"),
+            None
+        );
+    }
+
+    #[test]
+    fn generic_xattr_value_remains_byte_for_byte() {
+        let value = [0, 1, 0xff, 0x7f];
+        assert_eq!(
+            xattr_value_for_storage(XATTR_INDEX_USER, &value)
+                .unwrap()
+                .as_ref(),
+            value
+        );
     }
 }
