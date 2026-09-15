@@ -32,6 +32,8 @@ FORBIDDEN_ALLOCATOR_OUTPUT = (
     "Allocator stuck",
     "btree_cache_cannibalize_lock_blocked",
     "trans path overflow",
+    "path 0 refcount overflow",
+    "__btree_path_get",
 )
 RESERVATION_FIELDS = (
     "reservation_raw_extent_count",
@@ -117,6 +119,21 @@ def _reservation_metrics(output: str) -> dict[str, int]:
     missing = sorted(set(RESERVATION_FIELDS) - metrics.keys())
     assert not missing, f"missing reservation metrics {missing}:\n{output}"
     return metrics
+
+def _allocator_scan_metrics(output: str) -> dict[str, int]:
+    match = re.search(
+        r"(?m)^MIGRATE_ALLOCATOR_SCAN max_paths=(\d+) "
+        r"zero_ref_preserved_freespace_paths=(\d+) scans=(\d+) "
+        r"injected_restarts=(\d+)$",
+        output,
+    )
+    assert match, f"missing allocator scan metrics:\n{output}"
+    return {
+        "max_paths": int(match.group(1)),
+        "zero_ref_preserved_freespace_paths": int(match.group(2)),
+        "scans": int(match.group(3)),
+        "injected_restarts": int(match.group(4)),
+    }
 
 
 def _assert_bounded_allocator_result(result: subprocess.CompletedProcess[str]) -> None:
@@ -571,19 +588,49 @@ def test_c_child_subvolume_no_change_is_rejected_without_reservation(
 
 def test_stress_migrate_is_bounded_and_avoids_allocator_path_leaks(
     btrfs_image: BtrfsImage,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _fragment_available_space(btrfs_image)
+    # This remains small enough for a routine integration run while exercising
+    # the actual allocator scan. The binary reports per-scan path high-water
+    # marks only when this fixture enables the test-only metrics switch.
     _write_tree(btrfs_image, directories=128, files_per_directory=48)
     btrfs_image.sync()
     btrfs_image.assert_writable_top_level()
+    monkeypatch.setenv("BCACHEFS_TEST_ALLOCATOR_SCAN_METRICS", "1")
 
     result = _migrate(btrfs_image, "-f")
 
+    assert result.returncode == 0, result.stdout
     _assert_bounded_allocator_result(result)
-    if result.returncode == 0:
-        metrics = _reservation_metrics(result.stdout)
-        assert metrics["reservation_usable_full_bucket_bytes"] > 0, result.stdout
-        assert "MIGRATE_RESULT eligible=yes" in result.stdout, result.stdout
+    metrics = _reservation_metrics(result.stdout)
+    scan_metrics = _allocator_scan_metrics(result.stdout)
+    assert metrics["reservation_usable_full_bucket_bytes"] > 0, result.stdout
+    assert scan_metrics["scans"] > 0, result.stdout
+    assert scan_metrics["zero_ref_preserved_freespace_paths"] <= 1, result.stdout
+    assert scan_metrics["max_paths"] <= 16, result.stdout
+    assert "MIGRATE_RESULT eligible=yes" in result.stdout, result.stdout
+
+def test_allocator_scan_restart_unwinds_and_retries(
+    btrfs_image: BtrfsImage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fragment_available_space(btrfs_image)
+    _write_tree(btrfs_image, directories=32, files_per_directory=16)
+    btrfs_image.sync()
+    btrfs_image.assert_writable_top_level()
+    monkeypatch.setenv("BCACHEFS_TEST_ALLOCATOR_SCAN_METRICS", "1")
+    monkeypatch.setenv("BCACHEFS_TEST_ALLOCATOR_SCAN_INJECT_RESTART", "1")
+
+    result = _migrate(btrfs_image, "-f")
+
+    assert result.returncode == 0, result.stdout
+    _assert_bounded_allocator_result(result)
+    scan_metrics = _allocator_scan_metrics(result.stdout)
+    assert scan_metrics["injected_restarts"] == 1, result.stdout
+    assert scan_metrics["scans"] > 1, result.stdout
+    assert scan_metrics["zero_ref_preserved_freespace_paths"] <= 1, result.stdout
+    assert scan_metrics["max_paths"] <= 16, result.stdout
 
 
 def test_retry_existing_migration_reservation_is_bounded_and_valid(

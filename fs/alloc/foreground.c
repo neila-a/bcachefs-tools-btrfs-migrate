@@ -52,6 +52,101 @@
 #include <linux/rcupdate.h>
 #include <linux/sched/signal.h>
 
+#ifndef __KERNEL__
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#endif
+
+#ifndef __KERNEL__
+struct bucket_alloc_scan_metrics {
+	atomic_uint	max_paths;
+	atomic_uint	max_zero_ref_preserved_freespace_paths;
+	atomic_uint	scans;
+	atomic_uint	injected_restarts;
+};
+
+static struct bucket_alloc_scan_metrics bucket_alloc_scan_metrics;
+
+static void bucket_alloc_scan_metrics_report(void)
+{
+	fprintf(stderr,
+		"MIGRATE_ALLOCATOR_SCAN max_paths=%u zero_ref_preserved_freespace_paths=%u scans=%u injected_restarts=%u\n",
+		atomic_load(&bucket_alloc_scan_metrics.max_paths),
+		atomic_load(&bucket_alloc_scan_metrics.max_zero_ref_preserved_freespace_paths),
+		atomic_load(&bucket_alloc_scan_metrics.scans),
+		atomic_load(&bucket_alloc_scan_metrics.injected_restarts));
+}
+
+static bool bucket_alloc_scan_metrics_enabled(void)
+{
+	static int enabled = -1;
+
+	if (likely(enabled >= 0))
+		return enabled;
+
+	enabled = !!getenv("BCACHEFS_TEST_ALLOCATOR_SCAN_METRICS");
+	if (enabled)
+		atexit(bucket_alloc_scan_metrics_report);
+	return enabled;
+}
+
+static bool bucket_alloc_scan_should_inject_restart(void)
+{
+	static atomic_bool injected;
+
+	if (!bucket_alloc_scan_metrics_enabled() ||
+	    !getenv("BCACHEFS_TEST_ALLOCATOR_SCAN_INJECT_RESTART"))
+		return false;
+
+	if (atomic_exchange(&injected, true))
+		return false;
+
+	atomic_fetch_add(&bucket_alloc_scan_metrics.injected_restarts, 1);
+	return true;
+}
+
+static void bucket_alloc_scan_metrics_max(atomic_uint *max, unsigned value)
+{
+	unsigned old = atomic_load(max);
+
+	while (old < value &&
+	       !atomic_compare_exchange_weak(max, &old, value))
+		;
+}
+
+static void bucket_alloc_scan_metrics_record(struct btree_trans *trans)
+{
+	struct btree_path *path;
+	unsigned i, preserved = 0;
+
+	if (!bucket_alloc_scan_metrics_enabled())
+		return;
+
+	trans_for_each_path(trans, path, i)
+		if (!path->ref &&
+		    path->preserve &&
+		    path->btree_id == BTREE_ID_freespace)
+			preserved++;
+
+	atomic_fetch_add(&bucket_alloc_scan_metrics.scans, 1);
+	bucket_alloc_scan_metrics_max(&bucket_alloc_scan_metrics.max_paths,
+			bitmap_weight(trans->paths_allocated, trans->nr_paths));
+	bucket_alloc_scan_metrics_max(
+		&bucket_alloc_scan_metrics.max_zero_ref_preserved_freespace_paths,
+		preserved);
+}
+#else
+static inline void bucket_alloc_scan_metrics_record(struct btree_trans *trans)
+{
+}
+
+static inline bool bucket_alloc_scan_should_inject_restart(void)
+{
+	return false;
+}
+#endif
+
 static void bch2_trans_mutex_lock_norelock(struct btree_trans *trans,
 					   struct mutex *lock)
 {
@@ -576,6 +671,7 @@ static struct open_bucket *bch2_bucket_alloc_freelist(struct btree_trans *trans,
 			u64 genbits = g << 56;
 			struct open_bucket *ob = bucket_alloc_scan(trans, req, genbits,
 					max(start, genbits | ca->mi.first_bucket), true);
+			bucket_alloc_scan_metrics_record(trans);
 			if (ob) {
 				if (!IS_ERR(ob))
 					*dev_alloc_cursor = genbits | ob->bucket;
@@ -629,6 +725,7 @@ static struct open_bucket *bch2_bucket_alloc_target(struct btree_trans *trans,
 			struct open_bucket *ob =
 				bucket_alloc_scan(trans, req, genbits,
 							      target, forwards);
+			bucket_alloc_scan_metrics_record(trans);
 			if (IS_ERR(ob)) {
 				if (best)
 					bch2_open_bucket_put(c, best);
