@@ -15,6 +15,16 @@
 #include "init/passes.h"
 #include "init/progress.h"
 
+#define FREESPACE_ALLOC_ITER_FLAGS(_async_repair)			\
+	((_async_repair)							\
+	 ? (BTREE_ITER_cached|BTREE_ITER_committed|BTREE_ITER_nopreserve)	\
+	 : 0)
+
+static_assert(FREESPACE_ALLOC_ITER_FLAGS(true) & BTREE_ITER_nopreserve,
+	      "async allocator checks must not preserve fresh alloc-tree paths");
+static_assert(FREESPACE_ALLOC_ITER_FLAGS(false) == 0,
+	      "synchronous fsck checks must retain their existing iterator flags");
+
 /*
  * This synthesizes deleted extents for holes, similar to BTREE_ITER_slots for
  * extents style btrees, but works on non-extents btrees:
@@ -433,12 +443,12 @@ int __bch2_check_freespace_key(struct btree_trans *trans, struct btree_iter *ite
 
 	/*
 	 * async_repair means we're the allocator: committed-only reads, see
-	 * bucket_alloc_scan(). fsck's synchronous use keeps normal semantics:
+	 * bucket_alloc_scan(). It probes a fresh bucket on every call, so this
+	 * nested alloc-tree iterator must not preserve its path: CLASS cleanup
+	 * then lets bch2_path_put() release it. fsck keeps normal semantics.
 	 */
 	CLASS(btree_iter, alloc_iter)(trans, BTREE_ID_alloc, bucket,
-						     async_repair
-						     ? BTREE_ITER_cached|BTREE_ITER_committed
-						     : 0);
+				     FREESPACE_ALLOC_ITER_FLAGS(async_repair));
 	struct bkey_s_c alloc_k = bkey_try(bch2_btree_iter_peek_slot(&alloc_iter));
 
 	if (!bch2_dev_bucket_exists(c, bucket)) {
