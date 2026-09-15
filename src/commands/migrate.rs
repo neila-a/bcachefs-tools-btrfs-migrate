@@ -1318,10 +1318,10 @@ fn cmd_migrate(argv: Vec<String>) -> Result<()> {
         }
         Err(error) => return Err(error),
     };
+    print_preflight(source_path, &source);
     if no_change {
         return run_no_change(source_path, &source);
     }
-    print_preflight(source_path, &source);
 
     // Build format_opts with version detection
     let mut fmt_opts = format_opts_default();
