@@ -200,6 +200,22 @@ fn acl_type_name(xattr_type: i32) -> Option<&'static str> {
     }
 }
 
+fn acl_inode_flag(xattr_type: i32) -> Option<u32> {
+    match xattr_type {
+        XATTR_INDEX_ACL_ACCESS => {
+            Some(c::bch_inode_flags::BCH_INODE_has_access_acl as u32)
+        }
+        XATTR_INDEX_ACL_DEFAULT => {
+            Some(c::bch_inode_flags::BCH_INODE_has_default_acl as u32)
+        }
+        _ => None,
+    }
+}
+
+fn add_acl_inode_flag(inode_flags: u32, xattr_type: i32) -> u32 {
+    inode_flags | acl_inode_flag(xattr_type).unwrap_or(0)
+}
+
 fn mode_to_type(mode: u32) -> u8 {
     ((mode >> 12) & 15) as u8
 }
@@ -598,6 +614,7 @@ fn copy_xattrs(
             None => continue,
         };
         let acl_kind = acl_type_name(xattr_type);
+        let acl_flag = acl_inode_flag(xattr_type);
 
         let mut val_buf = vec![0u8; 65536]; // XATTR_SIZE_MAX
         let attr_cstr = CString::new(attr_name).unwrap();
@@ -659,6 +676,25 @@ fn copy_xattrs(
                 );
             }
             return Err(error);
+        }
+
+        if acl_flag.is_some() {
+            // xattr::set() commits its transaction before returning.  The
+            // userspace copy path has no suitable same-transaction inode
+            // write API, so persist the ACL flag immediately instead of
+            // relying on recursive copying's final inode update.
+            dst.bi_flags = add_acl_inode_flag(dst.bi_flags, xattr_type);
+            if let Err(error) = update_inode(fs, dst) {
+                if let Some(acl_kind) = acl_kind {
+                    eprintln!(
+                        "Unable to migrate POSIX {} ACL on {}: failed to persist inode ACL flag: {}",
+                        acl_kind,
+                        display_path.to_string_lossy(),
+                        error
+                    );
+                }
+                return Err(error);
+            }
         }
     }
 
@@ -1743,5 +1779,76 @@ mod tests {
                 .as_ref(),
             value
         );
+    }
+    #[test]
+    fn access_acl_maps_to_access_inode_flag() {
+        assert_eq!(
+            acl_inode_flag(XATTR_INDEX_ACL_ACCESS),
+            Some(c::bch_inode_flags::BCH_INODE_has_access_acl as u32)
+        );
+    }
+
+    #[test]
+    fn default_acl_maps_to_default_inode_flag() {
+        assert_eq!(
+            acl_inode_flag(XATTR_INDEX_ACL_DEFAULT),
+            Some(c::bch_inode_flags::BCH_INODE_has_default_acl as u32)
+        );
+    }
+
+    #[test]
+    fn generic_xattrs_do_not_map_to_acl_flags() {
+        assert_eq!(acl_inode_flag(XATTR_INDEX_USER), None);
+        assert_eq!(acl_inode_flag(XATTR_INDEX_TRUSTED), None);
+        assert_eq!(acl_inode_flag(XATTR_INDEX_SECURITY), None);
+    }
+
+    #[test]
+    fn setting_access_flag_preserves_unrelated_inode_flags() {
+        let unrelated = c::bch_inode_flags::BCH_INODE_unlinked as u32;
+        let flags = add_acl_inode_flag(unrelated, XATTR_INDEX_ACL_ACCESS);
+        assert_eq!(flags & unrelated, unrelated);
+        assert_ne!(
+            flags & (c::bch_inode_flags::BCH_INODE_has_access_acl as u32),
+            0
+        );
+    }
+
+    #[test]
+    fn setting_default_flag_preserves_unrelated_inode_flags() {
+        let unrelated = c::bch_inode_flags::BCH_INODE_unlinked as u32;
+        let flags = add_acl_inode_flag(unrelated, XATTR_INDEX_ACL_DEFAULT);
+        assert_eq!(flags & unrelated, unrelated);
+        assert_ne!(
+            flags & (c::bch_inode_flags::BCH_INODE_has_default_acl as u32),
+            0
+        );
+    }
+
+    #[test]
+    fn setting_both_acl_flags_sets_both_bits() {
+        let flags = add_acl_inode_flag(
+            add_acl_inode_flag(0, XATTR_INDEX_ACL_ACCESS),
+            XATTR_INDEX_ACL_DEFAULT,
+        );
+        assert_ne!(
+            flags & (c::bch_inode_flags::BCH_INODE_has_access_acl as u32),
+            0
+        );
+        assert_ne!(
+            flags & (c::bch_inode_flags::BCH_INODE_has_default_acl as u32),
+            0
+        );
+    }
+
+    #[test]
+    fn directory_default_acl_receives_flag_for_immediate_persist() {
+        let unrelated = c::bch_inode_flags::BCH_INODE_has_inode_opts as u32;
+        let flags = add_acl_inode_flag(unrelated, XATTR_INDEX_ACL_DEFAULT);
+        assert_eq!(
+            flags & (c::bch_inode_flags::BCH_INODE_has_default_acl as u32),
+            c::bch_inode_flags::BCH_INODE_has_default_acl as u32
+        );
+        assert_eq!(flags & unrelated, unrelated);
     }
 }

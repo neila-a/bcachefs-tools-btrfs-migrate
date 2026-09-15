@@ -15,6 +15,12 @@ from typing import Any
 
 
 CHUNK_SIZE = 1024 * 1024
+PORTABLE_XATTR_PREFIXES = (b"user.", b"trusted.", b"security.")
+
+
+def _is_portable_xattr(name: bytes) -> bool:
+    return name.startswith(PORTABLE_XATTR_PREFIXES)
+
 
 POSIX_ACL_XATTR_VERSION = 0x0002
 POSIX_ACL_XATTR_HEADER_SIZE = 4
@@ -132,6 +138,8 @@ def _xattrs(
             if include_acls:
                 value = os.getxattr(path, name, follow_symlinks=False)
                 acls[acl_key] = _parse_linux_posix_acl_xattr(value)
+            continue
+        if not _is_portable_xattr(name_bytes):
             continue
         value = os.getxattr(path, name, follow_symlinks=False)
         xattrs[name_bytes.hex()] = value.hex()
@@ -372,6 +380,194 @@ def main(argv: list[str]) -> int:
 
     print(f"MANIFEST_OK {root}")
     return 0
+
+
+def _fake_xattrs(monkeypatch, path: Path, values: dict[bytes, bytes]) -> None:
+    path_bytes = os.fsencode(path)
+    original_listxattr = os.listxattr
+    original_getxattr = os.getxattr
+
+    def listxattr(candidate: str | bytes, *, follow_symlinks: bool = True):
+        if os.fsencode(candidate) == path_bytes:
+            return list(values)
+        return original_listxattr(candidate, follow_symlinks=follow_symlinks)
+
+    def getxattr(
+        candidate: str | bytes,
+        name: str | bytes,
+        *,
+        follow_symlinks: bool = True,
+    ):
+        candidate_bytes = os.fsencode(candidate)
+        name_bytes = os.fsencode(name)
+        if candidate_bytes == path_bytes and name_bytes in values:
+            return values[name_bytes]
+        return original_getxattr(
+            candidate, name, follow_symlinks=follow_symlinks
+        )
+
+    monkeypatch.setattr(os, "listxattr", listxattr)
+    monkeypatch.setattr(os, "getxattr", getxattr)
+
+
+def _linux_acl_value(entries: list[tuple[int, int, int]]) -> bytes:
+    value = POSIX_ACL_XATTR_VERSION.to_bytes(4, "little")
+    for tag, perm, entry_id in entries:
+        value += tag.to_bytes(2, "little")
+        value += perm.to_bytes(2, "little")
+        value += entry_id.to_bytes(4, "little")
+    return value
+
+
+def test_user_xattr_is_recorded_and_verified(tmp_path: Path):
+    root = tmp_path / "root"
+    root.mkdir()
+    payload = root / "payload"
+    payload.write_bytes(b"manifest payload")
+    os.setxattr(payload, b"user.foo", b"\x00\x01\xff")
+    manifest_path = tmp_path / "manifest.json"
+
+    assert main(["manifest", "create", str(root), str(manifest_path)]) == 0
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload_entry = next(
+        entry for entry in manifest["entries"] if entry["path"] == "cGF5bG9hZA=="
+    )
+    assert payload_entry["xattrs"] == {b"user.foo".hex(): b"\x00\x01\xff".hex()}
+    assert main(["manifest", "verify", str(root), str(manifest_path)]) == 0
+
+
+def test_trusted_xattr_is_portable_when_readable(tmp_path: Path, monkeypatch):
+    payload = tmp_path / "payload"
+    payload.write_bytes(b"payload")
+    _fake_xattrs(monkeypatch, payload, {b"trusted.foo": b"trusted value"})
+
+    xattrs, acls = _xattrs(os.fsencode(payload), include_acls=False)
+
+    assert xattrs == {b"trusted.foo".hex(): b"trusted value".hex()}
+    assert acls == {}
+
+
+def test_security_xattr_is_portable_when_readable(tmp_path: Path, monkeypatch):
+    payload = tmp_path / "payload"
+    payload.write_bytes(b"payload")
+    _fake_xattrs(monkeypatch, payload, {b"security.foo": b"security value"})
+
+    xattrs, acls = _xattrs(os.fsencode(payload), include_acls=False)
+
+    assert xattrs == {b"security.foo".hex(): b"security value".hex()}
+    assert acls == {}
+
+
+def test_system_acl_xattrs_are_semantic_not_raw(tmp_path: Path, monkeypatch):
+    payload = tmp_path / "payload"
+    payload.write_bytes(b"payload")
+    access_value = _linux_acl_value(
+        [
+            (0x20, 0, ACL_UNDEFINED_ID),
+            (0x02, 4, 123),
+            (0x01, 7, ACL_UNDEFINED_ID),
+            (0x10, 5, ACL_UNDEFINED_ID),
+            (0x04, 5, ACL_UNDEFINED_ID),
+        ]
+    )
+    default_value = _linux_acl_value(
+        [
+            (0x04, 5, ACL_UNDEFINED_ID),
+            (0x01, 7, ACL_UNDEFINED_ID),
+            (0x20, 0, ACL_UNDEFINED_ID),
+        ]
+    )
+    _fake_xattrs(
+        monkeypatch,
+        payload,
+        {
+            b"system.posix_acl_access": access_value,
+            b"system.posix_acl_default": default_value,
+        },
+    )
+
+    xattrs, acls = _xattrs(os.fsencode(payload), include_acls=True)
+
+    assert xattrs == {}
+    assert acls == {
+        "acl_access": [
+            ["user_obj", 7, None],
+            ["user", 4, 123],
+            ["group_obj", 5, None],
+            ["mask", 5, None],
+            ["other", 0, None],
+        ],
+        "acl_default": [
+            ["user_obj", 7, None],
+            ["group_obj", 5, None],
+            ["other", 0, None],
+        ],
+    }
+
+
+def test_btrfs_compression_xattr_is_ignored(tmp_path: Path, monkeypatch):
+    payload = tmp_path / "payload"
+    payload.write_bytes(b"payload")
+    _fake_xattrs(monkeypatch, payload, {b"btrfs.compression": b"zstd"})
+
+    xattrs, acls = _xattrs(os.fsencode(payload), include_acls=True)
+
+    assert xattrs == {}
+    assert acls == {}
+
+
+def test_bcachefs_xattrs_are_ignored(tmp_path: Path, monkeypatch):
+    payload = tmp_path / "payload"
+    payload.write_bytes(b"payload")
+    _fake_xattrs(
+        monkeypatch,
+        payload,
+        {
+            b"bcachefs.foo": b"private",
+            b"bcachefs_effective.foo": b"effective",
+        },
+    )
+
+    xattrs, acls = _xattrs(os.fsencode(payload), include_acls=True)
+
+    assert xattrs == {}
+    assert acls == {}
+
+
+def test_acl_manifest_mismatch_is_detected(tmp_path: Path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    payload = root / "payload"
+    payload.write_bytes(b"payload")
+    expected = {
+        "entries": [
+            {
+                "path": base64.b64encode(b"payload").decode("ascii"),
+                "acl_access": [["user_obj", 7, None]],
+            }
+        ]
+    }
+
+    def mismatched_acls(path: bytes) -> dict[str, list[list[Any]]]:
+        return {"acl_access": [["user_obj", 5, None]], "acl_default": []}
+
+    monkeypatch.setattr(sys.modules[__name__], "_getfacl_acls", mismatched_acls)
+
+    assert _verify_acl_manifest(root, expected) is False
+
+
+def test_user_xattr_byte_mismatch_is_detected(tmp_path: Path):
+    root = tmp_path / "root"
+    root.mkdir()
+    payload = root / "payload"
+    payload.write_bytes(b"manifest payload")
+    os.setxattr(payload, b"user.foo", b"original")
+    manifest_path = tmp_path / "manifest.json"
+
+    assert main(["manifest", "create", str(root), str(manifest_path)]) == 0
+    os.setxattr(payload, b"user.foo", b"changed")
+
+    assert main(["manifest", "verify", str(root), str(manifest_path)]) == 1
 
 
 if __name__ == "__main__":
