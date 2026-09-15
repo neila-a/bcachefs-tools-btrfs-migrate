@@ -496,7 +496,8 @@ bucket_alloc_scan(struct btree_trans *trans, struct alloc_request *req,
 	 * allocation path must carry this flag.
 	 */
 	CLASS(btree_iter, iter)(trans, BTREE_ID_freespace,
-				POS(ca->dev_idx, pos), BTREE_ITER_committed);
+				POS(ca->dev_idx, pos),
+				BTREE_ITER_committed | BTREE_ITER_nopreserve);
 
 	while (1) {
 		if (!forwards && pos < min.offset)
