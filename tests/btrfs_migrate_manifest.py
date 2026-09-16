@@ -42,6 +42,11 @@ ACL_TAG_NAMES = {
 ACL_SHORT_TAGS = frozenset({0x01, 0x04, 0x10, 0x20})
 ACL_NAMED_TAGS = frozenset({0x02, 0x08})
 ACL_MANIFEST_KEYS = ("acl_access", "acl_default")
+
+BCACHEFS_LOST_FOUND_PATH = b"lost+found"
+BCACHEFS_LOST_FOUND_ENTRY_PATH = base64.b64encode(BCACHEFS_LOST_FOUND_PATH).decode(
+    "ascii"
+)
 ACL_TAG_ORDER = {
     "user_obj": 0,
     "user": 1,
@@ -337,12 +342,69 @@ def _verify_acl_manifest(root: Path, expected: dict[str, Any]) -> bool:
     return matches
 
 
+def _allow_bcachefs_lost_found(
+    expected: dict[str, Any], actual: dict[str, Any]
+) -> None:
+    expected_paths = {entry["path"] for entry in expected.get("entries", [])}
+    if BCACHEFS_LOST_FOUND_ENTRY_PATH in expected_paths:
+        return
+
+    lost_found_entries = [
+        entry
+        for entry in actual["entries"]
+        if entry["path"] == BCACHEFS_LOST_FOUND_ENTRY_PATH
+    ]
+    if len(lost_found_entries) != 1:
+        return
+
+    descendants = []
+    for entry in actual["entries"]:
+        relative = base64.b64decode(entry["path"], validate=True)
+        if relative.startswith(BCACHEFS_LOST_FOUND_PATH + b"/"):
+            descendants.append(relative)
+    if descendants:
+        for descendant in descendants:
+            print(
+                "MANIFEST_UNEXPECTED_LOST_FOUND_DESCENDANT "
+                f"{os.fsdecode(descendant)}",
+                file=sys.stderr,
+            )
+        return
+
+    lost_found = lost_found_entries[0]
+    if (
+        lost_found["type"] != "directory"
+        or lost_found["uid"] != 0
+        or lost_found["gid"] != 0
+        or lost_found["mode"] != 0o700
+    ):
+        return
+
+    actual["entries"] = [
+        entry
+        for entry in actual["entries"]
+        if entry["path"] != BCACHEFS_LOST_FOUND_ENTRY_PATH
+    ]
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 4 or argv[1] not in {"create", "verify"}:
-        print(f"usage: {argv[0]} create|verify ROOT MANIFEST", file=sys.stderr)
+    allow_bcachefs_lost_found = (
+        len(argv) == 5
+        and argv[1] == "verify"
+        and argv[2] == "--allow-bcachefs-lost-found"
+    )
+    if allow_bcachefs_lost_found:
+        operation, root_text, manifest_text = argv[1], argv[3], argv[4]
+    elif len(argv) == 4 and argv[1] in {"create", "verify"}:
+        operation, root_text, manifest_text = argv[1:]
+    else:
+        print(
+            f"usage: {argv[0]} create ROOT MANIFEST | "
+            "verify [--allow-bcachefs-lost-found] ROOT MANIFEST",
+            file=sys.stderr,
+        )
         return 2
 
-    operation, root_text, manifest_text = argv[1:]
     root = Path(root_text)
     manifest_path = Path(manifest_text)
     actual = _manifest(root, include_acls=operation == "create")
@@ -364,6 +426,8 @@ def main(argv: list[str]) -> int:
             _without_acls(entry) for entry in expected.get("entries", [])
         ],
     }
+    if allow_bcachefs_lost_found:
+        _allow_bcachefs_lost_found(expected_without_acls, actual)
     if expected_without_acls != actual:
         print("MANIFEST_MISMATCH", file=sys.stderr)
         expected_entries = {
@@ -570,6 +634,182 @@ def test_user_xattr_byte_mismatch_is_detected(tmp_path: Path):
     assert main(["manifest", "verify", str(root), str(manifest_path)]) == 1
 
 
+
+
+def _manifest_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    source = tmp_path / "source"
+    source.mkdir()
+    payload = source / "payload"
+    payload.write_bytes(b"source payload")
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    os.link(payload, candidate / "payload")
+    manifest_path = tmp_path / "source-manifest.json"
+    assert main(["manifest", "create", str(source), str(manifest_path)]) == 0
+    return candidate, manifest_path
+
+
+def _override_lstat(
+    monkeypatch,
+    path: Path,
+    *,
+    uid: int = 0,
+    gid: int = 0,
+    mode: int = 0o700,
+) -> None:
+    target = os.fsencode(path)
+    original_lstat = os.lstat
+
+    def lstat(candidate: str | bytes):
+        info = original_lstat(candidate)
+        if os.fsencode(candidate) != target:
+            return info
+        return type(
+            "StatOverride",
+            (),
+            {
+                "st_mode": stat.S_IFMT(info.st_mode) | mode,
+                "st_uid": uid,
+                "st_gid": gid,
+                "st_mtime_ns": info.st_mtime_ns,
+                "st_size": info.st_size,
+                "st_nlink": info.st_nlink,
+                "st_dev": info.st_dev,
+                "st_ino": info.st_ino,
+                "st_rdev": info.st_rdev,
+            },
+        )()
+
+    monkeypatch.setattr(os, "lstat", lstat)
+
+
+def _canonical_lost_found_fixture(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    uid: int = 0,
+    gid: int = 0,
+    mode: int = 0o700,
+) -> tuple[Path, Path, Path]:
+    candidate, manifest_path = _manifest_fixture(tmp_path)
+    lost_found = candidate / "lost+found"
+    lost_found.mkdir()
+    os.chmod(lost_found, 0o700)
+    _override_lstat(monkeypatch, lost_found, uid=uid, gid=gid, mode=mode)
+    return candidate, manifest_path, lost_found
+
+
+def _verify_with_lost_found(candidate: Path, manifest_path: Path) -> int:
+    return main(
+        [
+            "manifest",
+            "verify",
+            "--allow-bcachefs-lost-found",
+            str(candidate),
+            str(manifest_path),
+        ]
+    )
+
+
+def test_canonical_lost_found_is_rejected_without_allow_flag(tmp_path: Path, monkeypatch):
+    candidate, manifest_path, _ = _canonical_lost_found_fixture(tmp_path, monkeypatch)
+
+    assert main(["manifest", "verify", str(candidate), str(manifest_path)]) == 1
+
+
+def test_canonical_lost_found_is_accepted_with_allow_flag(tmp_path: Path, monkeypatch):
+    candidate, manifest_path, _ = _canonical_lost_found_fixture(tmp_path, monkeypatch)
+
+    assert _verify_with_lost_found(candidate, manifest_path) == 0
+
+
+def test_lost_found_with_wrong_uid_is_rejected(tmp_path: Path, monkeypatch):
+    candidate, manifest_path, _ = _canonical_lost_found_fixture(
+        tmp_path, monkeypatch, uid=1
+    )
+
+    assert _verify_with_lost_found(candidate, manifest_path) == 1
+
+
+def test_lost_found_with_wrong_gid_is_rejected(tmp_path: Path, monkeypatch):
+    candidate, manifest_path, _ = _canonical_lost_found_fixture(
+        tmp_path, monkeypatch, gid=1
+    )
+
+    assert _verify_with_lost_found(candidate, manifest_path) == 1
+
+
+def test_lost_found_with_wrong_mode_is_rejected(tmp_path: Path, monkeypatch):
+    candidate, manifest_path, _ = _canonical_lost_found_fixture(
+        tmp_path, monkeypatch, mode=0o755
+    )
+
+    assert _verify_with_lost_found(candidate, manifest_path) == 1
+
+
+def test_lost_found_symlink_is_rejected(tmp_path: Path):
+    candidate, manifest_path = _manifest_fixture(tmp_path)
+    (candidate / "lost+found").symlink_to("payload")
+
+    assert _verify_with_lost_found(candidate, manifest_path) == 1
+
+
+def test_nonempty_lost_found_reports_unexpected_descendant(
+    tmp_path: Path, monkeypatch, capsys
+):
+    candidate, manifest_path, lost_found = _canonical_lost_found_fixture(
+        tmp_path, monkeypatch
+    )
+    (lost_found / "child").write_bytes(b"unexpected")
+
+    assert _verify_with_lost_found(candidate, manifest_path) == 1
+    assert "MANIFEST_UNEXPECTED_LOST_FOUND_DESCENDANT lost+found/child" in capsys.readouterr().err
+
+
+def test_lost_found_descendants_are_all_reported(tmp_path: Path, monkeypatch, capsys):
+    candidate, manifest_path, lost_found = _canonical_lost_found_fixture(
+        tmp_path, monkeypatch
+    )
+    child = lost_found / "child"
+    child.mkdir()
+    (child / "grandchild").write_bytes(b"unexpected")
+
+    assert _verify_with_lost_found(candidate, manifest_path) == 1
+    stderr = capsys.readouterr().err
+    assert "MANIFEST_UNEXPECTED_LOST_FOUND_DESCENDANT lost+found/child" in stderr
+    assert "MANIFEST_UNEXPECTED_LOST_FOUND_DESCENDANT lost+found/child/grandchild" in stderr
+
+
+def test_unrelated_additional_candidate_path_is_rejected(
+    tmp_path: Path, monkeypatch
+):
+    candidate, manifest_path, _ = _canonical_lost_found_fixture(tmp_path, monkeypatch)
+    (candidate / "unexpected").write_bytes(b"unexpected")
+
+    assert _verify_with_lost_found(candidate, manifest_path) == 1
+
+
+def test_regular_candidate_content_mismatch_is_rejected(
+    tmp_path: Path, monkeypatch
+):
+    candidate, manifest_path, _ = _canonical_lost_found_fixture(tmp_path, monkeypatch)
+    payload = candidate / "payload"
+    payload.unlink()
+    payload.write_bytes(b"changed payload")
+
+    assert _verify_with_lost_found(candidate, manifest_path) == 1
+
+
+def test_regular_candidate_metadata_mismatch_is_rejected(
+    tmp_path: Path, monkeypatch
+):
+    candidate, manifest_path, _ = _canonical_lost_found_fixture(tmp_path, monkeypatch)
+    payload = candidate / "payload"
+    payload.unlink()
+    payload.write_bytes(b"source payload")
+    os.chmod(payload, 0o600)
+
+    assert _verify_with_lost_found(candidate, manifest_path) == 1
 if __name__ == "__main__":
     try:
         raise SystemExit(main(sys.argv))
