@@ -278,6 +278,12 @@ void bch2_fatal_error(struct bch_fs *c, const char *func, const char *fmt, ...);
 #define bch2_fs_fatal_error(c, ...)					\
 	bch2_fatal_error(c, __func__, __VA_ARGS__)
 
+#ifndef __KERNEL__
+void bch2_test_migrate_stop_trace(struct bch_fs *, const char *);
+#else
+static inline void bch2_test_migrate_stop_trace(struct bch_fs *c, const char *stage) {}
+#endif
+
 #define bch2_fs_fatal_err_on(cond, c, ...)				\
 ({									\
 	bool _ret = unlikely(!!(cond));					\

@@ -92,6 +92,12 @@ fn return_if_migrate_cancelled() -> Result<()> {
     Ok(())
 }
 
+fn migrate_stop_trace(stage: &str, result: &str) {
+    if std::env::var_os("BCACHEFS_TEST_MIGRATE_STOP_TRACE").is_some() {
+        eprintln!("MIGRATE_STOP stage={stage} result={result}");
+    }
+}
+
 extern "C" {
     fn rust_set_bit(nr: c_ulong, addr: *mut c_ulong);
     fn rust_count_set_bits(addr: *const c_ulong, nbits: c_ulong) -> c_ulong;
@@ -1645,10 +1651,18 @@ fn migrate_fs(
         .map_err(|e| anyhow!("Error installing migration cancellation handler: {e}"))?;
     s.set_cancellation_probe(migrate_cancellation_requested);
     let copy_ret = crate::copy_fs::copy_fs(&fs, &mut s, fs_file.as_fd(), &fs_path_cstr);
+    migrate_stop_trace(
+        "copy_return",
+        if copy_ret.is_ok() { "success" } else { "error" },
+    );
     let reproducer_ret = prepare_going_ro_abort_reproducer(&fs);
 
-
+    migrate_stop_trace("fs_exit_begin", "entered");
     let exit_ret = fs.exit();
+    migrate_stop_trace(
+        "fs_exit_complete",
+        if exit_ret == 0 { "success" } else { "error" },
+    );
     drop(fs_file);
 
     copy_ret.map_err(|e| anyhow!("Error copying filesystem: {}", e))?;

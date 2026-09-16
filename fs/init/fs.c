@@ -81,6 +81,21 @@
 
 #ifndef __KERNEL__
 #include <stdio.h>
+#include <stdlib.h>
+
+void bch2_test_migrate_stop_trace(struct bch_fs *c, const char *stage)
+{
+	if (!getenv("BCACHEFS_TEST_MIGRATE_STOP_TRACE"))
+		return;
+
+	fprintf(stderr,
+		"MIGRATE_STOP stage=%s journal_error=%u emergency_ro=%u going_ro=%u write_disable_complete=%u\n",
+		stage,
+		bch2_journal_error(&c->journal),
+		test_bit(BCH_FS_emergency_ro, &c->flags),
+		test_bit(BCH_FS_going_ro, &c->flags),
+		test_bit(BCH_FS_write_disable_complete, &c->flags));
+}
 #endif
 
 #include <linux/backing-dev.h>
@@ -357,6 +372,7 @@ static void __bch2_fs_read_only(struct bch_fs *c)
 
 	do {
 		clean_passes++;
+		bch2_test_migrate_stop_trace(c, "clean_pass_begin");
 #ifndef __KERNEL__
 		if (bch2_test_key_cache_going_ro_abort_enabled())
 			fprintf(stderr, "MIGRATE_ABORT_RO_STAGE clean_pass=%u\n", clean_passes);
@@ -370,18 +386,34 @@ static void __bch2_fs_read_only(struct bch_fs *c)
 		 * existing emergency teardown, which cancels those writes before
 		 * draining their updates.
 		 */
-		if (bch2_journal_error(&c->journal))
+		if (bch2_journal_error(&c->journal)) {
+			bch2_test_migrate_stop_trace(c, "clean_pass_journal_error");
 			break;
+		}
 
 		bch2_do_discards_going_ro(c);
 
 		int key_cache_ret = 0;
-		bool did_work =
-			bch2_btree_write_buffer_flush_going_ro(c) ||
-			(key_cache_ret = bch2_btree_key_cache_flush_going_ro(c)) ||
-			bch2_btree_interior_updates_flush(c) ||
-			bch2_journal_flush_all_pins(&c->journal) ||
-			bch2_btree_flush_all_writes(c);
+		bch2_test_migrate_stop_trace(c, "write_buffer_flush_begin");
+		bool did_work = bch2_btree_write_buffer_flush_going_ro(c);
+		bch2_test_migrate_stop_trace(c, "write_buffer_flush_complete");
+		if (!did_work) {
+			key_cache_ret = bch2_btree_key_cache_flush_going_ro(c);
+			did_work = key_cache_ret;
+			bch2_test_migrate_stop_trace(c, "key_cache_flush_complete");
+		}
+		if (!did_work) {
+			did_work = bch2_btree_interior_updates_flush(c);
+			bch2_test_migrate_stop_trace(c, "interior_updates_flush_complete");
+		}
+		if (!did_work) {
+			did_work = bch2_journal_flush_all_pins(&c->journal);
+			bch2_test_migrate_stop_trace(c, "journal_pins_flush_complete");
+		}
+		if (!did_work) {
+			did_work = bch2_btree_flush_all_writes(c);
+			bch2_test_migrate_stop_trace(c, "btree_writes_flush_complete");
+		}
 
 		if (did_work || seq != atomic64_read(&c->journal.seq)) {
 			seq = atomic64_read(&c->journal.seq);
@@ -390,6 +422,7 @@ static void __bch2_fs_read_only(struct bch_fs *c)
 
 		if (key_cache_ret &&
 		    bch2_err_matches(key_cache_ret, BCH_ERR_no_buckets_found)) {
+			bch2_test_migrate_stop_trace(c, "key_cache_no_buckets_fatal");
 			bch2_fs_fatal_error(c,
 				"flushing key cache while going read-only: %s",
 				bch2_err_str(key_cache_ret));
@@ -403,6 +436,7 @@ static void __bch2_fs_read_only(struct bch_fs *c)
 	if (bch2_test_key_cache_going_ro_abort_enabled())
 		fprintf(stderr, "MIGRATE_ABORT_RO_STAGE clean_loop_complete\n");
 #endif
+	bch2_test_migrate_stop_trace(c, "clean_loop_complete");
 
 	/*
 	 * On a dead journal the clean-shutdown loop above can't make dirty
@@ -417,6 +451,7 @@ static void __bch2_fs_read_only(struct bch_fs *c)
 	if (bch2_journal_error(&c->journal)) {
 		bch2_btree_cancel_all_writes(c);
 		bch2_btree_interior_updates_flush(c);
+		bch2_test_migrate_stop_trace(c, "emergency_write_cancel_complete");
 	}
 
 	bch_verbose(c, "flushing journal and stopping allocators complete, journal seq %llu",
@@ -459,6 +494,7 @@ static void bch2_writes_disabled(struct enumerated_ref *writes)
 void bch2_fs_read_only(struct bch_fs *c)
 {
 	if (!test_bit(BCH_FS_rw, &c->flags)) {
+		bch2_test_migrate_stop_trace(c, "already_read_only");
 		bch2_journal_reclaim_stop(&c->journal);
 		return;
 	}
@@ -466,7 +502,6 @@ void bch2_fs_read_only(struct bch_fs *c)
 	BUG_ON(test_bit(BCH_FS_write_disable_complete, &c->flags));
 
 	bch_verbose(c, "going read-only");
-
 	/*
 	 * Block new foreground-end write operations from starting - any new
 	 * writes will return -EROFS. Set before stopping reconcile so the
@@ -474,6 +509,7 @@ void bch2_fs_read_only(struct bch_fs *c)
 	 * out) see it while bch2_reconcile_stop() is blocked waiting on them.
 	 */
 	set_bit(BCH_FS_going_ro, &c->flags);
+	bch2_test_migrate_stop_trace(c, "going_ro_enter");
 
 	/*
 	 * Stop background kthreads that issue writes (reconcile, etc.)
@@ -507,16 +543,19 @@ void bch2_fs_read_only(struct bch_fs *c)
 	if (bch2_test_key_cache_going_ro_abort_enabled())
 		fprintf(stderr, "MIGRATE_ABORT_RO_STAGE writes_disable_wait_complete\n");
 #endif
+	bch2_test_migrate_stop_trace(c, "writes_disable_wait_complete");
 
 	bool writes_disabled = test_bit(BCH_FS_write_disable_complete, &c->flags);
 	if (writes_disabled)
 		bch_verbose(c, "finished waiting for writes to stop");
 
+	bch2_test_migrate_stop_trace(c, "clean_shutdown_begin");
 	__bch2_fs_read_only(c);
 #ifndef __KERNEL__
 	if (bch2_test_key_cache_going_ro_abort_enabled())
 		fprintf(stderr, "MIGRATE_ABORT_RO_STAGE clean_loop_returned\n");
 #endif
+	bch2_test_migrate_stop_trace(c, "clean_shutdown_complete");
 
 	wait_event(bch2_read_only_wait,
 		   test_bit(BCH_FS_write_disable_complete, &c->flags));
@@ -524,6 +563,7 @@ void bch2_fs_read_only(struct bch_fs *c)
 	if (bch2_test_key_cache_going_ro_abort_enabled())
 		fprintf(stderr, "MIGRATE_ABORT_RO_STAGE writes_disabled_finally\n");
 #endif
+	bch2_test_migrate_stop_trace(c, "writes_disabled_finally");
 
 	if (!writes_disabled)
 		bch_verbose(c, "finished waiting for writes to stop");
@@ -796,12 +836,14 @@ static void bch2_fs_release(struct kobject *kobj)
 
 int bch2_fs_stop(struct bch_fs *c)
 {
+	bch2_test_migrate_stop_trace(c, "fs_stop_enter");
 	if (!test_and_set_bit(BCH_FS_stopping, &c->flags)) {
 		if (test_bit(BCH_FS_started, &c->flags))
 			bch_verbose(c, "shutting down");
 
 		scoped_guard(rwsem_write, &c->state_lock)
 			bch2_fs_read_only(c);
+		bch2_test_migrate_stop_trace(c, "fs_stop_read_only_complete");
 
 		for (unsigned i = 0; i < c->sb.nr_devices; i++) {
 			struct bch_dev *ca = rcu_dereference_protected(c->devs[i], true);
@@ -837,6 +879,7 @@ int bch2_fs_stop(struct bch_fs *c)
 
 		flush_work(&c->btree.interior_updates.work);
 	}
+	bch2_test_migrate_stop_trace(c, "fs_stop_return");
 
 	if (test_bit(BCH_FS_emergency_ro, &c->flags))
 		return bch_err_throw(c, shutdown_with_emergency_ro);

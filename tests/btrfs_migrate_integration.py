@@ -723,6 +723,21 @@ def _wait_for_migrate_exit(process: subprocess.Popen[str], timeout: float) -> st
         pytest.fail(f"migrate teardown exceeded {timeout}s:\n{output}")
     return output
 
+def _wait_for_migrate_self_termination(
+    process: subprocess.Popen[str], timeout: float
+) -> str:
+    try:
+        output, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        output = error.output or ""
+        pytest.fail(
+            f"migrate did not self-terminate within {timeout}s; "
+            f"no signal was sent to process group {process.pid}:\n{output}"
+        )
+    return output
+
+
+
 
 def _wait_for_migrate_output(
     process: subprocess.Popen[str], marker: str, timeout: float
@@ -1024,6 +1039,10 @@ def test_allocator_scan_restart_unwinds_and_retries(
 def test_copy_capacity_preflight_rejects_before_candidate_writes(
     btrfs_image: BtrfsImage,
 ) -> None:
+    # Populate foreground metadata before the shared-data copies consume the
+    # candidate reservation: the later exhaustion must flush that normal
+    # foreground write buffer, not a synthetic post-copy reproducer.
+    _write_tree(btrfs_image, directories=128, files_per_directory=48)
     _write_copy_pressure_fixture(btrfs_image)
     manifest = _manifest(btrfs_image.mountpoint)
 
@@ -1048,11 +1067,43 @@ def test_copy_capacity_preflight_rejects_before_candidate_writes(
         env={
             **os.environ,
             "BCACHEFS_TEST_BYPASS_COPY_FEASIBILITY": "1",
+            "BCACHEFS_TEST_MIGRATE_STOP_TRACE": "1",
         },
     )
-    legacy_output = _wait_for_migrate_exit(legacy, MIGRATE_TIMEOUT_SECONDS)
+    legacy_output = _wait_for_migrate_self_termination(
+        legacy, GOING_RO_ABORT_TIMEOUT_SECONDS
+    )
     assert legacy.returncode != 0, legacy_output
+    assert "MIGRATE_RESERVATION_NOUSE " in legacy_output, legacy_output
     assert "no_buckets_found" in legacy_output, legacy_output
+    assert (
+        "bch2_btree_write_buffer_flush_locked(): fatal error no_buckets_found"
+        in legacy_output
+    ), legacy_output
+    for marker in (
+        "MIGRATE_STOP stage=fatal_error",
+        "MIGRATE_STOP stage=emergency_ro",
+        "MIGRATE_STOP stage=copy_return result=error",
+        "MIGRATE_STOP stage=fs_exit_begin",
+        "MIGRATE_STOP stage=fs_stop_enter",
+        "MIGRATE_STOP stage=write_buffer_flush_begin",
+        "MIGRATE_STOP stage=emergency_write_cancel_complete",
+        "MIGRATE_STOP stage=fs_stop_return",
+        "MIGRATE_STOP stage=fs_exit_complete result=error",
+    ):
+        assert marker in legacy_output, legacy_output
+    assert legacy_output.index("MIGRATE_STOP stage=fatal_error") < legacy_output.index(
+        "MIGRATE_STOP stage=emergency_ro"
+    )
+    assert legacy_output.index(
+        "MIGRATE_STOP stage=copy_return result=error"
+    ) < legacy_output.index("MIGRATE_STOP stage=fs_exit_begin")
+    assert legacy_output.index(
+        "MIGRATE_STOP stage=fs_stop_enter"
+    ) < legacy_output.index("MIGRATE_STOP stage=fs_stop_return")
+    assert legacy_output.index(
+        "MIGRATE_STOP stage=fs_stop_return"
+    ) < legacy_output.index("MIGRATE_STOP stage=fs_exit_complete result=error")
     assert _reservation_state(btrfs_image) == reservation_before
     _assert_manifest(btrfs_image.mountpoint, manifest)
 
