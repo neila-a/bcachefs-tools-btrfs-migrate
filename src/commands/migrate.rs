@@ -391,26 +391,33 @@ const MIGRATION_ALLOCATOR_HEADROOM_FRACTION: u64 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CopyFeasibility {
+    logical_copy_bytes: u64,
+    padded_copy_bytes: u64,
     allocator_headroom_bytes: u64,
-    usable_capacity_bytes: u64,
-    required_bytes: u64,
+    required_reservation_bytes: u64,
+    reservation_usable_full_bucket_bytes: u64,
     fits: bool,
 }
 
-fn copy_feasibility(capacity: &ReservationCapacity, predicted_copy_bytes: u64) -> CopyFeasibility {
+fn copy_feasibility(
+    capacity: &ReservationCapacity,
+    copied: &CopyAccounting,
+) -> CopyFeasibility {
     let allocator_headroom_bytes = (capacity.usable_full_bucket_bytes
         / MIGRATION_ALLOCATOR_HEADROOM_FRACTION)
         .max(MIN_MIGRATION_ALLOCATOR_HEADROOM_BYTES)
         .min(capacity.usable_full_bucket_bytes);
-    let usable_capacity_bytes = capacity
-        .usable_full_bucket_bytes
-        .saturating_sub(allocator_headroom_bytes);
-    let required_bytes = predicted_copy_bytes.saturating_add(allocator_headroom_bytes);
+    let logical_copy_bytes = copied.copied_bytes;
+    let padded_copy_bytes = copied.allocated_copy_bytes;
+    let required_reservation_bytes =
+        padded_copy_bytes.saturating_add(allocator_headroom_bytes);
     CopyFeasibility {
+        logical_copy_bytes,
+        padded_copy_bytes,
         allocator_headroom_bytes,
-        usable_capacity_bytes,
-        required_bytes,
-        fits: predicted_copy_bytes < usable_capacity_bytes,
+        required_reservation_bytes,
+        reservation_usable_full_bucket_bytes: capacity.usable_full_bucket_bytes,
+        fits: required_reservation_bytes < capacity.usable_full_bucket_bytes,
     }
 }
 
@@ -448,26 +455,51 @@ fn print_copy_reasons(mode: &str, copied: &CopyAccounting) -> Result<()> {
     Ok(())
 }
 
+fn print_copy_feasibility(
+    feasibility: CopyFeasibility,
+    verdict: &str,
+    reason: Option<&str>,
+) {
+    match reason {
+        Some(reason) => println!(
+            "MIGRATE_COPY_FEASIBILITY verdict={} logical_copy_bytes={} padded_copy_bytes={} allocator_headroom_bytes={} required_reservation_bytes={} reservation_usable_full_bucket_bytes={} reason={}",
+            verdict,
+            feasibility.logical_copy_bytes,
+            feasibility.padded_copy_bytes,
+            feasibility.allocator_headroom_bytes,
+            feasibility.required_reservation_bytes,
+            feasibility.reservation_usable_full_bucket_bytes,
+            reason,
+        ),
+        None => println!(
+            "MIGRATE_COPY_FEASIBILITY verdict={} logical_copy_bytes={} padded_copy_bytes={} allocator_headroom_bytes={} required_reservation_bytes={} reservation_usable_full_bucket_bytes={}",
+            verdict,
+            feasibility.logical_copy_bytes,
+            feasibility.padded_copy_bytes,
+            feasibility.allocator_headroom_bytes,
+            feasibility.required_reservation_bytes,
+            feasibility.reservation_usable_full_bucket_bytes,
+        ),
+    }
+}
+
 fn ensure_copy_feasibility(
     capacity: &ReservationCapacity,
-    predicted_copy_bytes: u64,
+    copied: &CopyAccounting,
 ) -> Result<CopyFeasibility> {
-    let feasibility = copy_feasibility(capacity, predicted_copy_bytes);
-    println!(
-        "MIGRATE_COPY_FEASIBILITY verdict={} predicted_copy_bytes={} reservation_usable_full_bucket_bytes={} allocator_headroom_bytes={} usable_capacity_bytes={} required_bytes={}",
-        if feasibility.fits { "fit" } else { "reject" },
-        predicted_copy_bytes,
-        capacity.usable_full_bucket_bytes,
-        feasibility.allocator_headroom_bytes,
-        feasibility.usable_capacity_bytes,
-        feasibility.required_bytes,
+    let feasibility = copy_feasibility(capacity, copied);
+    print_copy_feasibility(
+        feasibility,
+        if feasibility.fits { "accept" } else { "reject" },
+        None,
     );
     if !feasibility.fits {
         bail!(
-            "migration copy preflight predicts {} copy bytes, which must be strictly below the {} usable reservation bytes ({} bytes before allocator headroom)",
-            predicted_copy_bytes,
-            feasibility.usable_capacity_bytes,
-            capacity.usable_full_bucket_bytes,
+            "migration copy preflight requires {} bytes ({} padded copy bytes + {} allocator headroom bytes), but the reservation exposes only {} usable full-bucket bytes",
+            feasibility.required_reservation_bytes,
+            feasibility.padded_copy_bytes,
+            feasibility.allocator_headroom_bytes,
+            feasibility.reservation_usable_full_bucket_bytes,
         );
     }
     Ok(feasibility)
@@ -506,10 +538,12 @@ fn print_no_change_reservation_geometry(capacity: Option<&ReservationCapacity>) 
     }
 }
 
-fn print_unavailable_copy_feasibility(predicted_copy_bytes: u64) {
+fn print_unavailable_copy_feasibility(copied: &CopyAccounting) {
     println!(
-        "MIGRATE_COPY_FEASIBILITY verdict=unavailable predicted_copy_bytes={} reservation_usable_full_bucket_bytes=0 allocator_headroom_bytes=0 usable_capacity_bytes=0 required_bytes=0",
-        predicted_copy_bytes,
+        "MIGRATE_COPY_FEASIBILITY verdict=reject logical_copy_bytes={} padded_copy_bytes={} allocator_headroom_bytes=0 required_reservation_bytes={} reservation_usable_full_bucket_bytes=0 reason=reservation_geometry_unavailable",
+        copied.copied_bytes,
+        copied.allocated_copy_bytes,
+        copied.allocated_copy_bytes,
     );
 }
 
@@ -1571,9 +1605,9 @@ fn run_no_change(
     print_no_change_reservation_geometry(existing_reservation_capacity.as_ref());
     match existing_reservation_capacity.as_ref() {
         Some(capacity) => {
-            ensure_copy_feasibility(capacity, stats.copy_accounting.allocated_copy_bytes)?;
+            ensure_copy_feasibility(capacity, &stats.copy_accounting)?;
         }
-        None => print_unavailable_copy_feasibility(stats.copy_accounting.allocated_copy_bytes),
+        None => print_unavailable_copy_feasibility(&stats.copy_accounting),
     }
     let eligible = stats.eligible;
     println!(
@@ -1690,13 +1724,12 @@ fn migrate_fs(
     )?;
     print_copy_reasons("preflight", &preflight_stats.copy_accounting)?;
     if !preflight_stats.eligible {
-        println!("MIGRATE_COPY_FEASIBILITY verdict=reject reason=unstable_extent");
+        let feasibility = copy_feasibility(&reservation_capacity, &preflight_stats.copy_accounting);
+        print_copy_feasibility(feasibility, "reject", Some("unstable_extent"));
         bail!("migration copy preflight found unstable source extents after sync");
     }
-    let _copy_feasibility = ensure_copy_feasibility(
-        &reservation_capacity,
-        preflight_stats.copy_accounting.allocated_copy_bytes,
-    )?;
+    let copy_feasibility =
+        ensure_copy_feasibility(&reservation_capacity, &preflight_stats.copy_accounting)?;
 
     // Find superblock location within reserved extents
     let (sb_offset, sb_end) = find_superblock_space(
@@ -1790,8 +1823,7 @@ fn migrate_fs(
         migration_policy.reserved_superblock_end,
         refreshed_mapper,
         nouse_state.allocatable_bytes,
-        _copy_feasibility.allocator_headroom_bytes,
-        preflight_stats.copy_accounting.allocated_copy_bytes,
+        copy_feasibility.allocator_headroom_bytes,
     );
     // Pre-populate with metadata reservation ranges
     for e in &extents {
@@ -2182,8 +2214,14 @@ mod tests {
             ExtentDisposition::Unstable,
         );
     }
+    fn copy_accounting(logical_copy_bytes: u64, padded_copy_bytes: u64) -> CopyAccounting {
+        let mut copied = CopyAccounting::default();
+        copied.record_with_allocation(CopyReason::Other, logical_copy_bytes, padded_copy_bytes);
+        copied
+    }
+
     #[test]
-    fn copy_feasibility_rejects_retry_four_copy_estimate() {
+    fn copy_feasibility_rejects_padded_copy_that_only_fits_without_headroom() {
         let capacity = ReservationCapacity {
             raw_extent_count: 0,
             raw_bytes: 0,
@@ -2194,17 +2232,21 @@ mod tests {
             usable_full_bucket_count: 0,
             usable_full_bucket_bytes: 54_749_298_688,
         };
+        let copied = copy_accounting(49_430_000_000, 49_430_093_395);
 
-        let feasibility = copy_feasibility(&capacity, 49_430_093_395);
+        let feasibility = copy_feasibility(&capacity, &copied);
 
+        assert_eq!(feasibility.logical_copy_bytes, 49_430_000_000);
+        assert_eq!(feasibility.padded_copy_bytes, 49_430_093_395);
         assert_eq!(feasibility.allocator_headroom_bytes, 6_843_662_336);
-        assert_eq!(feasibility.usable_capacity_bytes, 47_905_636_352);
-        assert_eq!(feasibility.required_bytes, 56_273_755_731);
+        assert_eq!(feasibility.required_reservation_bytes, 56_273_755_731);
+        assert_eq!(feasibility.reservation_usable_full_bucket_bytes, 54_749_298_688);
+        assert!(feasibility.padded_copy_bytes < feasibility.reservation_usable_full_bucket_bytes);
         assert!(!feasibility.fits);
     }
 
     #[test]
-    fn copy_feasibility_requires_strictly_less_than_usable_capacity() {
+    fn copy_feasibility_accepts_requirement_strictly_below_capacity() {
         let capacity = ReservationCapacity {
             raw_extent_count: 0,
             raw_bytes: 0,
@@ -2215,10 +2257,71 @@ mod tests {
             usable_full_bucket_count: 0,
             usable_full_bucket_bytes: 54_749_298_688,
         };
-        let usable_capacity_bytes = copy_feasibility(&capacity, 0).usable_capacity_bytes;
+        let copied = copy_accounting(47_905_636_351, 47_905_636_351);
 
-        assert!(!copy_feasibility(&capacity, usable_capacity_bytes).fits);
-        assert!(copy_feasibility(&capacity, usable_capacity_bytes - 1).fits);
+        let feasibility = copy_feasibility(&capacity, &copied);
+
+        assert_eq!(feasibility.required_reservation_bytes, 54_749_298_687);
+        assert!(feasibility.fits);
+    }
+
+    #[test]
+    fn copy_feasibility_rejects_required_reservation_equal_to_capacity() {
+        let capacity = ReservationCapacity {
+            raw_extent_count: 0,
+            raw_bytes: 0,
+            bucket_size_bytes: 0,
+            default_superblock_protected_bytes: 0,
+            device_tail_bytes: 0,
+            bucket_alignment_loss_bytes: 0,
+            usable_full_bucket_count: 0,
+            usable_full_bucket_bytes: 54_749_298_688,
+        };
+        let copied = copy_accounting(47_905_636_352, 47_905_636_352);
+
+        let feasibility = copy_feasibility(&capacity, &copied);
+
+        assert_eq!(feasibility.required_reservation_bytes, 54_749_298_688);
+        assert!(!feasibility.fits);
+    }
+
+    #[test]
+    fn raw_alignment_salvage_reduces_padded_copy_and_changes_feasibility() {
+        let policy = MigrationCopyPolicy {
+            block_bytes: 4096,
+            reserved_superblock_end: 0,
+        };
+        let len = 24 * 1024 * 1024 + 137;
+        let plan = plan_raw_segment(0, 0, len, len, policy).unwrap();
+        let mut salvaged = CopyAccounting::default();
+        for span in plan.spans() {
+            if let RawSegmentDisposition::Copy(reason) = span.disposition {
+                salvaged.record_with_allocation(
+                    reason,
+                    span.len,
+                    copy_write_bytes(span.len, policy.block_bytes).unwrap(),
+                );
+            }
+        }
+        let unsalvageable = copy_accounting(
+            len,
+            copy_write_bytes(len, policy.block_bytes).unwrap(),
+        );
+        let capacity = ReservationCapacity {
+            raw_extent_count: 0,
+            raw_bytes: 0,
+            bucket_size_bytes: 0,
+            default_superblock_protected_bytes: 0,
+            device_tail_bytes: 0,
+            bucket_alignment_loss_bytes: 0,
+            usable_full_bucket_count: 0,
+            usable_full_bucket_bytes: 80 * 1024 * 1024,
+        };
+
+        assert_eq!(plan.raw_link_salvaged_bytes, len - 137);
+        assert!(salvaged.allocated_copy_bytes < unsalvageable.allocated_copy_bytes);
+        assert!(copy_feasibility(&capacity, &salvaged).fits);
+        assert!(!copy_feasibility(&capacity, &unsalvageable).fits);
     }
 
     #[test]
@@ -2478,7 +2581,6 @@ mod tests {
             42,
             0,
             refreshed_mapper,
-            0,
             0,
             0,
         );

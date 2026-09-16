@@ -56,6 +56,16 @@ RESERVATION_NOUSE_FIELDS = (
     "reservation_allocatable_bucket_count",
     "reservation_allocatable_bytes",
 )
+
+COPY_FEASIBILITY_FIELDS = (
+    "logical_copy_bytes",
+    "padded_copy_bytes",
+    "allocator_headroom_bytes",
+    "required_reservation_bytes",
+    "reservation_usable_full_bucket_bytes",
+)
+
+
 ALTERNATE_SUPERBLOCK_RE = re.compile(r"mount -t bcachefs -o ro,sb=(\d+)")
 
 
@@ -162,11 +172,11 @@ PROGRESS_FIELDS = (
     "linked_bytes",
     "copied_bytes",
     "elapsed_seconds",
-    "reservation_allocatable_bytes",
-    "reservation_copied_bytes",
-    "reservation_predicted_copy_bytes",
-    "reservation_allocator_headroom_bytes",
-    "reservation_required_remaining_bytes",
+    "logical_copy_bytes",
+    "padded_copy_bytes",
+    "allocator_headroom_bytes",
+    "required_reservation_bytes",
+    "reservation_usable_full_bucket_bytes",
     "reservation_remaining_bytes",
 )
 
@@ -243,6 +253,22 @@ def _migration_plan(output: str, mode: str) -> dict[str, int]:
     return {name: int(fields[name]) for name in PLAN_FIELDS}
 
 
+def _copy_feasibility(output: str) -> tuple[str, dict[str, int]]:
+    match = re.search(r"(?m)^MIGRATE_COPY_FEASIBILITY (?P<fields>.+)$", output)
+    assert match, f"missing copy feasibility:\n{output}"
+    fields = dict(field.split("=", 1) for field in match["fields"].split())
+    verdict = fields["verdict"]
+    assert verdict in {"accept", "reject"}, output
+    values = {name: int(fields[name]) for name in COPY_FEASIBILITY_FIELDS}
+    assert (
+        values["required_reservation_bytes"]
+        == values["padded_copy_bytes"] + values["allocator_headroom_bytes"]
+    ), output
+    return verdict, values
+
+
+
+
 
 
 def _migration_progress(output: str) -> list[dict[str, int]]:
@@ -261,6 +287,8 @@ def _migration_progress(output: str) -> list[dict[str, int]]:
         "elapsed_seconds",
         "linked_bytes",
         "copied_bytes",
+        "logical_copy_bytes",
+        "padded_copy_bytes",
     ):
         assert all(
             current[field] >= previous[field]
@@ -272,13 +300,15 @@ def _migration_progress(output: str) -> list[dict[str, int]]:
         for previous, current in zip(parsed, parsed[1:])
     ), output
     assert all(
-        record["reservation_allocatable_bytes"] > 0
-        and record["reservation_copied_bytes"] >= record["copied_bytes"]
+        record["reservation_usable_full_bucket_bytes"] > 0
+        and record["logical_copy_bytes"] == record["copied_bytes"]
+        and record["padded_copy_bytes"] >= record["logical_copy_bytes"]
+        and record["required_reservation_bytes"]
+        == record["padded_copy_bytes"] + record["allocator_headroom_bytes"]
+        and record["required_reservation_bytes"]
+        < record["reservation_usable_full_bucket_bytes"]
         and record["reservation_remaining_bytes"]
-        == record["reservation_allocatable_bytes"] - record["reservation_copied_bytes"]
-        and record["reservation_predicted_copy_bytes"]
-        + record["reservation_allocator_headroom_bytes"]
-        < record["reservation_allocatable_bytes"]
+        == record["reservation_usable_full_bucket_bytes"] - record["padded_copy_bytes"]
         for record in parsed
     ), output
     return parsed
@@ -600,7 +630,7 @@ def _write_non_directory_entries(image: BtrfsImage) -> None:
     os.mkfifo(image.mountpoint / "named-pipe")
 
 
-COPY_PRESSURE_FILE_BYTES = 672 * 1024 * 1024
+COPY_PRESSURE_FILE_BYTES = 560 * 1024 * 1024
 
 
 def _write_copy_pressure_fixture(image: BtrfsImage) -> None:
@@ -1080,7 +1110,14 @@ def test_copy_capacity_preflight_rejects_before_candidate_writes(
     result = _migrate(btrfs_image, "-f")
 
     assert result.returncode != 0, result.stdout
-    assert "MIGRATE_COPY_FEASIBILITY verdict=reject" in result.stdout, result.stdout
+    result_verdict, result_feasibility = _copy_feasibility(result.stdout)
+    assert result_verdict == "reject", result.stdout
+    assert (
+        result_feasibility["logical_copy_bytes"]
+        <= result_feasibility["padded_copy_bytes"]
+        < result_feasibility["reservation_usable_full_bucket_bytes"]
+        <= result_feasibility["required_reservation_bytes"]
+    ), result.stdout
     assert "initializing new filesystem" not in result.stdout, result.stdout
     assert "Migrate complete" not in result.stdout, result.stdout
     reservation_before = _reservation_state(btrfs_image)
@@ -1093,6 +1130,9 @@ def test_copy_capacity_preflight_rejects_before_candidate_writes(
         "source=existing_reservation nouse_bitmap=predicted"
     ) in retry_plan.stdout, retry_plan.stdout
     assert "MIGRATE_COPY_FEASIBILITY verdict=reject" in retry_plan.stdout, retry_plan.stdout
+    retry_verdict, retry_feasibility = _copy_feasibility(retry_plan.stdout)
+    assert retry_verdict == "reject", retry_plan.stdout
+    assert retry_feasibility == result_feasibility
     assert "MIGRATE_RESERVATION_NOUSE " not in retry_plan.stdout, retry_plan.stdout
     assert "initializing new filesystem" not in retry_plan.stdout, retry_plan.stdout
     assert _reservation_state(btrfs_image) == reservation_before
@@ -1173,7 +1213,12 @@ def test_retry_no_change_classifier_matches_runtime_with_existing_reservation(
         "MIGRATE_RESERVATION_GEOMETRY mode=no-change "
         "source=existing_reservation nouse_bitmap=predicted"
     ) in retry_plan.stdout, retry_plan.stdout
-    assert "MIGRATE_COPY_FEASIBILITY verdict=fit" in retry_plan.stdout, retry_plan.stdout
+    retry_verdict, retry_feasibility = _copy_feasibility(retry_plan.stdout)
+    assert retry_verdict == "accept", retry_plan.stdout
+    assert (
+        retry_feasibility["required_reservation_bytes"]
+        < retry_feasibility["reservation_usable_full_bucket_bytes"]
+    ), retry_plan.stdout
     assert "MIGRATE_RESERVATION_NOUSE " not in retry_plan.stdout, retry_plan.stdout
     assert retry_reasons == initial_reasons
     assert retry_stats == initial_stats
@@ -1182,6 +1227,9 @@ def test_retry_no_change_classifier_matches_runtime_with_existing_reservation(
     assert retried.returncode == 0, retried.stdout
     assert _copy_reasons(retried.stdout, "preflight") == retry_reasons
     assert _copy_reasons(retried.stdout, "migrate") == retry_reasons
+    preflight_verdict, preflight_feasibility = _copy_feasibility(retried.stdout)
+    assert preflight_verdict == "accept", retried.stdout
+    assert preflight_feasibility == retry_feasibility
     assert _migration_plan(retried.stdout, "migrate") == retry_stats
     assert _copy_policy(retry_plan.stdout, "no-change") == _copy_policy(
         retried.stdout, "migrate"

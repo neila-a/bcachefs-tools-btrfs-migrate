@@ -284,9 +284,8 @@ pub struct CopyFsState {
     pub mapped_extents: u64,
     pub mapped_segments: u64,
     pub chunk_splits: u64,
-    reservation_allocatable_bytes: u64,
+    reservation_usable_full_bucket_bytes: u64,
     reservation_allocator_headroom_bytes: u64,
-    reservation_predicted_copy_bytes: u64,
     copy_accounting: CopyAccounting,
     entries_total: u64,
     entries_done: u64,
@@ -324,9 +323,8 @@ impl CopyFsState {
             mapped_extents:   0,
             mapped_segments:  0,
             chunk_splits:     0,
-            reservation_allocatable_bytes: 0,
+            reservation_usable_full_bucket_bytes: 0,
             reservation_allocator_headroom_bytes: 0,
-            reservation_predicted_copy_bytes: 0,
             copy_accounting: CopyAccounting::default(),
             entries_total: 0,
             entries_done: 0,
@@ -345,9 +343,8 @@ impl CopyFsState {
         dev: u64,
         reserve_start: u64,
         mapper: ExtentMapper,
-        reservation_allocatable_bytes: u64,
+        reservation_usable_full_bucket_bytes: u64,
         reservation_allocator_headroom_bytes: u64,
-        reservation_predicted_copy_bytes: u64,
     ) -> Self {
         Self {
             migrate_type:   MigrateType::Migrate,
@@ -368,9 +365,8 @@ impl CopyFsState {
             mapped_extents:   0,
             mapped_segments:  0,
             chunk_splits:     0,
-            reservation_allocatable_bytes,
+            reservation_usable_full_bucket_bytes,
             reservation_allocator_headroom_bytes,
-            reservation_predicted_copy_bytes,
             copy_accounting: CopyAccounting::default(),
             entries_total: 0,
             entries_done: 0,
@@ -407,6 +403,32 @@ impl CopyFsState {
             .record_with_allocation(reason, bytes, allocated_bytes);
         self.total_wrote = self.copy_accounting.copied_bytes;
         self.total_allocated_wrote = self.copy_accounting.allocated_copy_bytes;
+    }
+
+    fn ensure_reservation_capacity_for_copy(&self, allocated_bytes: u64) -> Result<(), BchError> {
+        if self.migrate_type != MigrateType::Migrate {
+            return Ok(());
+        }
+
+        let padded_copy_bytes = self
+            .total_allocated_wrote
+            .checked_add(allocated_bytes)
+            .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+        let required_reservation_bytes = padded_copy_bytes
+            .checked_add(self.reservation_allocator_headroom_bytes)
+            .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+        if required_reservation_bytes >= self.reservation_usable_full_bucket_bytes {
+            eprintln!(
+                "migration copy requires {} bytes ({} padded copy bytes + {} allocator headroom bytes), but the reservation exposes only {} usable full-bucket bytes",
+                required_reservation_bytes,
+                padded_copy_bytes,
+                self.reservation_allocator_headroom_bytes,
+                self.reservation_usable_full_bucket_bytes,
+            );
+            return Err(BchError::from_raw(-libc::ENOSPC));
+        }
+
+        Ok(())
     }
 
     fn start_progress(&mut self, fs: &Fs, entries_total: u64) {
@@ -449,15 +471,14 @@ impl CopyFsState {
             return;
         }
 
-        let reservation_remaining_bytes = self
-            .reservation_allocatable_bytes
-            .saturating_sub(self.total_allocated_wrote);
-        let reservation_required_remaining_bytes = self
-            .reservation_predicted_copy_bytes
-            .saturating_sub(self.total_allocated_wrote)
+        let required_reservation_bytes = self
+            .total_allocated_wrote
             .saturating_add(self.reservation_allocator_headroom_bytes);
+        let reservation_remaining_bytes = self
+            .reservation_usable_full_bucket_bytes
+            .saturating_sub(self.total_allocated_wrote);
         eprintln!(
-            "MIGRATE_PROGRESS entries_done={} entries_total={} non_directories_done={} directories_done={} linked_bytes={} copied_bytes={} elapsed_seconds={} reservation_allocatable_bytes={} reservation_copied_bytes={} reservation_predicted_copy_bytes={} reservation_allocator_headroom_bytes={} reservation_required_remaining_bytes={} reservation_remaining_bytes={}",
+            "MIGRATE_PROGRESS entries_done={} entries_total={} non_directories_done={} directories_done={} linked_bytes={} copied_bytes={} elapsed_seconds={} logical_copy_bytes={} padded_copy_bytes={} allocator_headroom_bytes={} required_reservation_bytes={} reservation_usable_full_bucket_bytes={} reservation_remaining_bytes={}",
             self.entries_done,
             self.entries_total,
             self.non_directories_done,
@@ -465,11 +486,11 @@ impl CopyFsState {
             self.total_linked,
             self.total_wrote,
             self.progress_started.elapsed().as_secs(),
-            self.reservation_allocatable_bytes,
+            self.total_wrote,
             self.total_allocated_wrote,
-            self.reservation_predicted_copy_bytes,
             self.reservation_allocator_headroom_bytes,
-            reservation_required_remaining_bytes,
+            required_reservation_bytes,
+            self.reservation_usable_full_bucket_bytes,
             reservation_remaining_bytes,
         );
         self.progress_last_emitted = Instant::now();
@@ -812,6 +833,7 @@ fn copy_data(
         rustix::io::pread(src_fd, &mut buf[..len], pos)
             .map_err(rustix_err)?;
 
+        s.ensure_reservation_capacity_for_copy(padded as u64)?;
         write_data(fs, dst_inode, pos, &buf)?;
         s.record_copy(reason, len as u64, padded as u64);
         s.emit_progress(fs, false);
@@ -865,6 +887,7 @@ fn copy_link(
     buf[..target_bytes.len()].copy_from_slice(target_bytes);
     let padded = (link_len.div_ceil(block_size) * block_size) as usize;
 
+    s.ensure_reservation_capacity_for_copy(padded as u64)?;
     write_data(fs, dst, 0, &buf[..padded])?;
     s.record_copy(CopyReason::Symlink, link_len, padded as u64);
     Ok(())
@@ -1239,6 +1262,7 @@ fn copy_sync_file_range(
             if m.end == 0 {
                 break;
             }
+            s.ensure_reservation_capacity_for_copy(m.end - m.start)?;
             write_data(fs, dst, start + m.start, &src_buf[m.start as usize..m.end as usize])?;
             s.record_copy(CopyReason::Other, m.end - m.start, m.end - m.start);
         }
@@ -1796,7 +1820,7 @@ mod tests {
 
     #[test]
     fn emits_progress_after_interval_without_completed_entries() {
-        let mut state = CopyFsState::new_migrate(1, 1, 0, ExtentMapper::Identity, 0, 0, 0);
+        let mut state = CopyFsState::new_migrate(1, 1, 0, ExtentMapper::Identity, 0, 0);
         state.progress_last_emitted = Instant::now() - PROGRESS_INTERVAL;
 
         assert!(state.should_emit_progress());
