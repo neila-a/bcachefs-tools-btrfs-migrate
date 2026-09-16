@@ -10,6 +10,9 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import signal
+import stat
+import select
 import shutil
 import subprocess
 import time
@@ -25,6 +28,7 @@ BCACHEFS = Path(os.environ.get("BCACHEFS_BINARY", ROOT / "target/release/bcachef
 GIB = 1024**3
 IMAGE_BYTES = int(os.environ.get("BCACHEFS_MIGRATE_IMAGE_BYTES", 12 * GIB))
 MIGRATE_TIMEOUT_SECONDS = 5 * 60
+GOING_RO_ABORT_TIMEOUT_SECONDS = 5
 CANDIDATE_MOUNT_TIMEOUT_SECONDS = 30
 
 FORBIDDEN_ALLOCATOR_OUTPUT = (
@@ -134,6 +138,53 @@ def _allocator_scan_metrics(output: str) -> dict[str, int]:
         "scans": int(match.group(3)),
         "injected_restarts": int(match.group(4)),
     }
+
+PROGRESS_FIELDS = (
+    "entries_done",
+    "entries_total",
+    "non_directories_done",
+    "directories_done",
+    "linked_bytes",
+    "copied_bytes",
+    "elapsed_seconds",
+    "capacity_bytes",
+    "used_bytes",
+    "free_bytes",
+)
+
+
+def _migration_progress(output: str) -> list[dict[str, int]]:
+    progress = [
+        dict(field.split("=", 1) for field in match["fields"].split())
+        for match in re.finditer(r"(?m)^MIGRATE_PROGRESS (?P<fields>.+)$", output)
+    ]
+    assert progress, f"missing migration progress:\n{output}"
+    parsed = [{name: int(record[name]) for name in PROGRESS_FIELDS} for record in progress]
+    assert all(record["entries_total"] > 0 for record in parsed), output
+    assert len({record["entries_total"] for record in parsed}) == 1, output
+    for field in (
+        "entries_done",
+        "non_directories_done",
+        "directories_done",
+        "elapsed_seconds",
+        "linked_bytes",
+        "copied_bytes",
+    ):
+        assert all(
+            current[field] >= previous[field]
+            for previous, current in zip(parsed, parsed[1:])
+        ), output
+    assert all(
+        current["linked_bytes"] + current["copied_bytes"]
+        >= previous["linked_bytes"] + previous["copied_bytes"]
+        for previous, current in zip(parsed, parsed[1:])
+    ), output
+    assert all(
+        0 <= record["used_bytes"] <= record["capacity_bytes"]
+        and record["used_bytes"] + record["free_bytes"] == record["capacity_bytes"]
+        for record in parsed
+    ), output
+    return parsed
 
 
 def _assert_bounded_allocator_result(result: subprocess.CompletedProcess[str]) -> None:
@@ -446,6 +497,11 @@ def _write_tree(
             )
 
 
+def _write_non_directory_entries(image: BtrfsImage) -> None:
+    image.assert_writable_top_level()
+    os.symlink("dir-0000/file-0000", image.mountpoint / "tree-link")
+    os.mkfifo(image.mountpoint / "named-pipe")
+
 def _fragment_available_space(image: BtrfsImage) -> None:
     image.assert_writable_top_level()
     fragments = []
@@ -476,6 +532,80 @@ def _migrate(image: BtrfsImage, *args: str) -> subprocess.CompletedProcess[str]:
             f"bcachefs migrate exceeded {MIGRATE_TIMEOUT_SECONDS}s: {error.cmd}"
         )
 
+
+def _start_migrate(
+    image: BtrfsImage, *args: str, env: dict[str, str]
+) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [BCACHEFS, "migrate", *args, image.mountpoint],
+        text=True,
+        stdout=subprocess.PIPE,
+        bufsize=1,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env=env,
+    )
+
+
+def _stop_migrate(process: subprocess.Popen[str]) -> str:
+    if process.poll() is None:
+        os.killpg(process.pid, signal.SIGTERM)
+
+    try:
+        output, _ = process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        output, _ = process.communicate(timeout=5)
+
+    return output
+
+def _wait_for_migrate_exit(process: subprocess.Popen[str], timeout: float) -> str:
+    try:
+        output, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        output = _stop_migrate(process)
+        pytest.fail(f"migrate teardown exceeded {timeout}s:\n{output}")
+    return output
+
+
+def _wait_for_migrate_output(
+    process: subprocess.Popen[str], marker: str, timeout: float
+) -> str:
+    assert process.stdout is not None
+    output = ""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select(
+            [process.stdout], [], [], deadline - time.monotonic()
+        )
+        if not ready:
+            break
+        chunk = os.read(process.stdout.fileno(), 4096).decode()
+        if not chunk:
+            break
+        output += chunk
+        if marker in output:
+            return output
+    output += _stop_migrate(process)
+    pytest.fail(f"migrate did not emit {marker!r}:\n{output}")
+
+
+def _abort_diag(output: str) -> dict[str, str]:
+    match = re.search(r"(?m)^MIGRATE_ABORT_DIAG (?P<fields>.+)$", output)
+    assert match, output
+    return dict(field.split("=", 1) for field in match["fields"].split())
+
+
+def _wait_for_reservation(image: BtrfsImage, process: subprocess.Popen[str]) -> ReservationState:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if (image.mountpoint / "bcachefs").is_file():
+            return _reservation_state(image)
+        if process.poll() is not None:
+            break
+        time.sleep(0.05)
+    output = _stop_migrate(process)
+    pytest.fail(f"migrate exited before creating its Btrfs reservation:\n{output}")
 
 @dataclass(frozen=True)
 class ReservationState:
@@ -552,8 +682,8 @@ def test_b_supported_btrfs_migrates_with_full_reservation_metrics(
     btrfs_image: BtrfsImage,
 ) -> None:
     _write_tree(btrfs_image, directories=8, files_per_directory=16)
+    _write_non_directory_entries(btrfs_image)
     btrfs_image.sync()
-    btrfs_image.assert_writable_top_level()
 
     result = _migrate(btrfs_image, "-f")
 
@@ -562,7 +692,27 @@ def test_b_supported_btrfs_migrates_with_full_reservation_metrics(
     _assert_bounded_allocator_result(result)
     metrics = _reservation_metrics(result.stdout)
     assert metrics["reservation_usable_full_bucket_bytes"] > 0
+    progress = _migration_progress(result.stdout)
+    assert len(progress) == 2, result.stdout
+    assert progress[0]["entries_done"] == 0
+    assert progress[-1]["entries_done"] == progress[-1]["entries_total"] == 138
+    assert progress[-1]["non_directories_done"] == 130
+    assert progress[-1]["directories_done"] == 8
+    assert (
+        progress[-1]["non_directories_done"] + progress[-1]["directories_done"]
+        == progress[-1]["entries_total"]
+    )
     assert (btrfs_image.mountpoint / "bcachefs").is_file()
+    candidate = btrfs_image.mount_bcachefs_candidate_readonly(
+        _alternate_superblock(result.stdout)
+    )
+    try:
+        migrated_link = candidate / "tree-link"
+        assert migrated_link.is_symlink()
+        assert os.readlink(migrated_link) == "dir-0000/file-0000"
+        assert stat.S_ISFIFO((candidate / "named-pipe").stat().st_mode)
+    finally:
+        btrfs_image.unmount_bcachefs_candidate()
     btrfs_image.check_readonly()
 
 
@@ -584,6 +734,80 @@ def test_c_child_subvolume_no_change_is_rejected_without_reservation(
     assert "Root Tree returned a record outside the search key" not in result.stdout
     assert not (btrfs_image.mountpoint / "bcachefs").exists()
     assert _sha256(btrfs_image.image) == image_before
+
+
+
+def test_key_cache_going_ro_split_exhaustion_shutdown_is_bounded(
+    btrfs_image: BtrfsImage,
+) -> None:
+    _write_tree(btrfs_image, directories=4, files_per_directory=8)
+    btrfs_image.sync()
+    manifest = _manifest(btrfs_image.mountpoint)
+    process = _start_migrate(
+        btrfs_image,
+        "-f",
+        env={
+            **os.environ,
+            "BCACHEFS_TEST_GOING_RO_ABORT_REPRODUCER": "1",
+        },
+    )
+    reservation_before = _wait_for_reservation(btrfs_image, process)
+    output = _wait_for_migrate_output(
+        process, "MIGRATE_ABORT_REPRODUCER_READY ", timeout=30
+    )
+    output += _wait_for_migrate_exit(process, GOING_RO_ABORT_TIMEOUT_SECONDS)
+
+    assert process.returncode != 0, output
+
+    assert _reservation_state(btrfs_image) == reservation_before
+    _assert_manifest(btrfs_image.mountpoint, manifest)
+    diag = _abort_diag(output)
+    assert diag["classification"] == "nouse_exhausted", output
+    assert diag["allocator_outcome"] == "no_usable_buckets", output
+    assert int(diag["key_cache_nr_dirty"]) > 0, output
+    assert int(diag["reserve_cache_nr"]) >= 0, output
+    assert int(diag["open_buckets_nr_free"]) >= 0, output
+    assert diag["watermark"], output
+    assert int(diag["reserve_get_ret"]) != 0, output
+    assert int(diag["complete_device_scans"]) > 0, output
+    assert int(diag["split_attempts"]) > 0, output
+    assert int(diag["buckets_seen"]) > 0, output
+    assert int(diag["skipped_open"]) >= 0, output
+    assert int(diag["skipped_need_journal_commit"]) >= 0, output
+    assert int(diag["skipped_nouse"]) > 0, output
+    assert int(diag["skipped_mi_btree_bitmap"]) >= 0, output
+    assert int(diag["trace_entries"]) > 0, output
+    assert "MIGRATE_ABORT_TRACE " in output, output
+    assert "MIGRATE_ABORT_KEYCACHE result=" in output, output
+    assert "MIGRATE_ABORT_RO_STAGE clean_loop_complete" in output, output
+    assert "MIGRATE_ABORT_RO_STAGE writes_disabled_finally" in output, output
+
+def test_sigint_after_dirty_metadata_cancels_at_safe_boundary(
+    btrfs_image: BtrfsImage,
+) -> None:
+    _write_tree(btrfs_image, directories=4, files_per_directory=8)
+    btrfs_image.sync()
+    manifest = _manifest(btrfs_image.mountpoint)
+    process = _start_migrate(
+        btrfs_image,
+        "-f",
+        env={
+            **os.environ,
+            "BCACHEFS_TEST_INTERRUPT_AFTER_DIRTY": "1",
+        },
+    )
+    reservation_before = _wait_for_reservation(btrfs_image, process)
+    output = _wait_for_migrate_output(process, "MIGRATE_INTERRUPT_READY", timeout=30)
+    os.killpg(process.pid, signal.SIGINT)
+    output += _wait_for_migrate_exit(process, GOING_RO_ABORT_TIMEOUT_SECONDS)
+
+    assert process.returncode != 0, output
+    assert "MIGRATE_CANCELLATION requested=true" in output, output
+    assert "MIGRATE_ABORT_REPRODUCER_READY key_cache_nr_dirty=" in output, output
+    assert "MIGRATE_ABORT_LOOP" not in output, output
+    assert "Migrate complete" not in output, output
+    assert _reservation_state(btrfs_image) == reservation_before
+    _assert_manifest(btrfs_image.mountpoint, manifest)
 
 
 def test_stress_migrate_is_bounded_and_avoids_allocator_path_leaks(

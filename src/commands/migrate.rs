@@ -17,6 +17,8 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, bail, Result};
 use bch_bindgen::fs::FsExt;
@@ -37,9 +39,104 @@ use crate::wrappers::super_io;
 
 // ---- C shim declarations ----
 
+const GOING_RO_ABORT_REPRODUCER_KEYS: u64 = 12_000;
+
+static MIGRATE_CANCELLATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_migrate_cancellation(_: libc::c_int) {
+    MIGRATE_CANCELLATION_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+struct MigrateCancellationGuard {
+    previous_handler: libc::sighandler_t,
+}
+
+impl MigrateCancellationGuard {
+    fn install() -> io::Result<Self> {
+        MIGRATE_CANCELLATION_REQUESTED.store(false, Ordering::Relaxed);
+        let previous_handler = unsafe {
+            libc::signal(
+                libc::SIGINT,
+                request_migrate_cancellation as *const () as libc::sighandler_t,
+            )
+        };
+        if previous_handler == libc::SIG_ERR {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { previous_handler })
+    }
+}
+
+impl Drop for MigrateCancellationGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::signal(libc::SIGINT, self.previous_handler);
+        }
+    }
+}
+
+fn migrate_cancellation_requested() -> bool {
+    MIGRATE_CANCELLATION_REQUESTED.load(Ordering::Relaxed)
+}
+
+fn return_if_migrate_cancelled() -> Result<()> {
+    if migrate_cancellation_requested() {
+        eprintln!("MIGRATE_CANCELLATION requested=true");
+        bail!("migration cancelled");
+    }
+    Ok(())
+}
+
 extern "C" {
     fn rust_set_bit(nr: c_ulong, addr: *mut c_ulong);
+    fn bch2_test_key_cache_going_ro_abort_dirty(fs: *mut c::bch_fs, nr: u64) -> i32;
+    fn bch2_test_key_cache_going_ro_abort_ready(fs: *mut c::bch_fs);
 }
+
+fn run_btree_perf_test(fs: &Fs, test: &str) -> Result<()> {
+    let test_name = CString::new(test).expect("test name has no NUL");
+    let ret = unsafe {
+        bcachefs_kernel::debug::tests::bch2_btree_perf_test(
+            fs.raw,
+            test_name.as_ptr(),
+            GOING_RO_ABORT_REPRODUCER_KEYS,
+            1,
+        )
+    };
+    if ret != 0 {
+        bail!("Error running key-cache going-RO abort test {test} (ret={ret})");
+    }
+    Ok(())
+}
+
+fn prepare_going_ro_abort_reproducer(fs: &Fs) -> Result<()> {
+    let abort_reproducer =
+        std::env::var_os("BCACHEFS_TEST_GOING_RO_ABORT_REPRODUCER").is_some();
+    let interrupt_reproducer =
+        std::env::var_os("BCACHEFS_TEST_INTERRUPT_AFTER_DIRTY").is_some();
+    if !abort_reproducer && !interrupt_reproducer {
+        return Ok(());
+    }
+
+    run_btree_perf_test(fs, "seq_insert_uncached")?;
+    let ret = unsafe {
+        bch2_test_key_cache_going_ro_abort_dirty(fs.raw, GOING_RO_ABORT_REPRODUCER_KEYS)
+    };
+    if ret != 0 {
+        bail!("Error dirtying key-cache abort reproducer (ret={ret})");
+    }
+
+    unsafe { bch2_test_key_cache_going_ro_abort_ready(fs.raw) };
+    if interrupt_reproducer {
+        eprintln!("MIGRATE_INTERRUPT_READY");
+        while !migrate_cancellation_requested() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        return_if_migrate_cancelled()?;
+    }
+    Ok(())
+}
+
 
 use fiemap::FiemapExtentFlags;
 
@@ -1244,8 +1341,11 @@ Options:
   -n, --no-change              Read-only preflight and migration plan; never mutate
       --encrypted              Enable whole filesystem encryption (chacha20/poly1305)
       --no_passphrase          Store master encryption key unencrypted in superblock
-  -F                           Force, even if metadata file already exists
+  -F                           Retry an existing migration reservation
   -h, --help                   Display this help and exit
+
+Fresh migration:                 bcachefs migrate -f /mnt/source
+Existing-reservation retry:      bcachefs migrate -F -f /mnt/source
 
 Report bugs to <$$EMAIL_X7DPVIQXXN8Q:L$$>
 ");
@@ -1407,12 +1507,20 @@ fn migrate_fs(
         s.extents.push((e.start, e.end));
     }
 
+    let _cancellation_guard = MigrateCancellationGuard::install()
+        .map_err(|e| anyhow!("Error installing migration cancellation handler: {e}"))?;
+    s.set_cancellation_probe(migrate_cancellation_requested);
     let copy_ret = crate::copy_fs::copy_fs(&fs, &mut s, fs_file.as_fd(), &fs_path_cstr);
+    let reproducer_ret = prepare_going_ro_abort_reproducer(&fs);
+
 
     let exit_ret = fs.exit();
     drop(fs_file);
 
     copy_ret.map_err(|e| anyhow!("Error copying filesystem: {}", e))?;
+    reproducer_ret?;
+    return_if_migrate_cancelled()?;
+
     if exit_ret != 0 {
         bail!("Error closing filesystem (ret={})", exit_ret);
     }

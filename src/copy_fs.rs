@@ -12,6 +12,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::time::{Duration, Instant};
 
 use bch_bindgen::fs::FsExt;
 use bch_bindgen::c;
@@ -33,6 +34,9 @@ const BCACHEFS_ROOT_SUBVOL: u64 = 1;
 const DT_DIR: u8  = 4;
 const DT_REG: u8  = 8;
 const DT_LNK: u8  = 10;
+
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+const PROGRESS_ENTRY_INTERVAL: u64 = 10_000;
 
 /// Xattr namespace indices matching KEY_TYPE_XATTR_INDEX_* in xattr_format.h.
 const XATTR_INDEX_USER: i32     = 0;
@@ -298,6 +302,16 @@ pub struct CopyFsState {
     pub copied_other_flag: u64,
     pub copied_reserved: u64,
     pub copied_raw_unaligned: u64,
+    entries_total: u64,
+    entries_done: u64,
+    // All successfully copied non-directory dirents: regular files, symlinks,
+    // and special files.
+    non_directories_done: u64,
+    directories_done: u64,
+    progress_started: Instant,
+    progress_last_emitted: Instant,
+    progress_last_entries: u64,
+    cancellation_probe: Option<fn() -> bool>,
 
     /// Hardlink tracking: source inode -> destination inode
     hardlinks: HashMap<u64, u64>,
@@ -333,7 +347,15 @@ impl CopyFsState {
             copied_other_flag: 0,
             copied_reserved: 0,
             copied_raw_unaligned: 0,
+            entries_total: 0,
+            entries_done: 0,
+            non_directories_done: 0,
+            directories_done: 0,
+            progress_started: Instant::now(),
+            progress_last_emitted: Instant::now(),
+            progress_last_entries: 0,
             hardlinks:      HashMap::new(),
+            cancellation_probe: None,
         }
     }
 
@@ -371,9 +393,36 @@ impl CopyFsState {
             copied_other_flag: 0,
             copied_reserved: 0,
             copied_raw_unaligned: 0,
+            entries_total: 0,
+            entries_done: 0,
+            non_directories_done: 0,
+            directories_done: 0,
+            progress_started: Instant::now(),
+            progress_last_emitted: Instant::now(),
+            progress_last_entries: 0,
             hardlinks:      HashMap::new(),
+            cancellation_probe: None,
         }
     }
+
+    pub fn set_cancellation_probe(&mut self, probe: fn() -> bool) {
+        self.cancellation_probe = Some(probe);
+    }
+
+    fn check_cancellation(&self) -> Result<(), BchError> {
+        check_cancellation_probe(self.cancellation_probe)
+    }
+}
+
+fn check_cancellation_probe(probe: Option<fn() -> bool>) -> Result<(), BchError> {
+    if probe.is_some_and(|probe| probe()) {
+        eprintln!("MIGRATE_CANCELLATION requested=true");
+        return Err(BchError::from_raw(-libc::ECANCELED));
+    }
+    Ok(())
+}
+
+impl CopyFsState {
     fn record_copy(&mut self, reason: CopyReason, bytes: u64) {
         match reason {
             CopyReason::Encoded => self.copied_encoded += bytes,
@@ -397,6 +446,64 @@ impl CopyFsState {
             CopyReason::RawUnaligned => self.copied_raw_unaligned += bytes,
         }
         self.total_wrote += bytes;
+    }
+
+    fn start_progress(&mut self, fs: &Fs, entries_total: u64) {
+        self.entries_total = entries_total;
+        self.emit_progress(fs, true);
+    }
+
+    fn finish_entry(&mut self, fs: &Fs, is_directory: bool) -> Result<(), BchError> {
+        self.entries_done = self
+            .entries_done
+            .checked_add(1)
+            .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+        if is_directory {
+            self.directories_done = self
+                .directories_done
+                .checked_add(1)
+                .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+        } else {
+            self.non_directories_done = self
+                .non_directories_done
+                .checked_add(1)
+                .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+        }
+
+        self.emit_progress(fs, false);
+        Ok(())
+    }
+
+    fn finish_progress(&mut self, fs: &Fs) {
+        self.emit_progress(fs, true);
+    }
+
+    fn should_emit_progress(&self) -> bool {
+        self.entries_done - self.progress_last_entries >= PROGRESS_ENTRY_INTERVAL
+            || self.progress_last_emitted.elapsed() >= PROGRESS_INTERVAL
+    }
+
+    fn emit_progress(&mut self, fs: &Fs, force: bool) {
+        if !force && !self.should_emit_progress() {
+            return;
+        }
+
+        let usage = fs.usage_read_short();
+        eprintln!(
+            "MIGRATE_PROGRESS entries_done={} entries_total={} non_directories_done={} directories_done={} linked_bytes={} copied_bytes={} elapsed_seconds={} capacity_bytes={} used_bytes={} free_bytes={}",
+            self.entries_done,
+            self.entries_total,
+            self.non_directories_done,
+            self.directories_done,
+            self.total_linked,
+            self.total_wrote,
+            self.progress_started.elapsed().as_secs(),
+            usage.capacity.saturating_mul(512),
+            usage.used.saturating_mul(512),
+            usage.free.saturating_mul(512),
+        );
+        self.progress_last_emitted = Instant::now();
+        self.progress_last_entries = self.entries_done;
     }
 }
 
@@ -716,15 +823,18 @@ fn write_data(
 
 fn copy_data(
     fs: &Fs,
+    s: &mut CopyFsState,
     dst_inode: &mut c::bch_inode_unpacked,
     src_fd: BorrowedFd<'_>,
     start: u64,
     end: u64,
+    reason: CopyReason,
 ) -> Result<(), BchError> {
     let block_size = fs.block_bytes();
     let mut pos = start;
 
     while pos < end {
+        s.check_cancellation()?;
         let len = std::cmp::min(end - pos, MAX_IO_SIZE as u64) as usize;
         let padded = ((len as u64).div_ceil(block_size) * block_size) as usize;
 
@@ -733,6 +843,8 @@ fn copy_data(
             .map_err(rustix_err)?;
 
         write_data(fs, dst_inode, pos, &buf)?;
+        s.record_copy(reason, len as u64);
+        s.emit_progress(fs, false);
         pos += len as u64;
     }
 
@@ -824,6 +936,7 @@ fn link_file_data(
     }
 
     for extent in extents {
+        s.check_cancellation()?;
         if extent.fe_length == 0 {
             eprintln!(
                 "Zero-length FIEMAP extent in {}",
@@ -878,12 +991,13 @@ fn link_file_data(
         if let Some(reason) = extent_copy_reason(extent.fe_flags) {
             copy_data(
                 fs,
+                s,
                 dst,
                 src_fd,
                 extent.fe_logical,
                 extent_end,
+                reason,
             )?;
-            s.record_copy(reason, visible_len);
             continue;
         }
 
@@ -915,6 +1029,7 @@ fn link_file_data(
             .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
 
         for segment in segments {
+            s.check_cancellation()?;
             let segment_file_logical =
                 file_logical_for_segment(extent.fe_logical, extent.fe_physical, &segment)?;
             let segment_file_end = segment_file_logical
@@ -946,8 +1061,7 @@ fn link_file_data(
             };
 
             if let Some(reason) = reason {
-                copy_data(fs, dst, src_fd, copy_start, copy_end)?;
-                s.record_copy(reason, copy_len);
+                copy_data(fs, s, dst, src_fd, copy_start, copy_end, reason)?;
                 continue;
             }
 
@@ -1130,6 +1244,7 @@ fn copy_sync_file_range(
     let mut start = range.start;
 
     while start != range.end {
+        s.check_cancellation()?;
         let b = std::cmp::min(range.end - start, MAX_IO_SIZE as u64) as usize;
 
         let mut src_buf = AlignedBuf::new(b);
@@ -1170,6 +1285,7 @@ fn copy_sync_file_data(
     let mut prev = Range { start: 0, end: 0 };
 
     loop {
+        s.check_cancellation()?;
         let next = seek_data_aligned(src_fd, src_size, prev.end, block_size);
         if next.end == 0 {
             break;
@@ -1323,26 +1439,18 @@ struct DirEntryInfo {
     stat:   rustix::fs::Stat,
 }
 
-fn copy_dir(
-    fs: &Fs,
-    s: &mut CopyFsState,
-    dst: &mut c::bch_inode_unpacked,
-    src_fd: OwnedFd,
-    src_path: &CStr,
-) -> Result<(), BchError> {
+fn source_dirents(src_fd: &OwnedFd) -> Result<Vec<DirEntryInfo>, BchError> {
     // Dir::read_from borrows the fd (creating an internal dup for iteration),
     // so src_fd remains available for fstatat/openat/fchdir below.
-    let mut dir = rustix::fs::Dir::read_from(&src_fd).map_err(rustix_err)?;
-
+    let mut dir = rustix::fs::Dir::read_from(src_fd).map_err(rustix_err)?;
     let mut dirents = Vec::new();
 
     while let Some(entry) = dir.read() {
         let entry = entry.map_err(rustix_err)?;
-
         let name = entry.file_name();
 
         let stat = match rustix::fs::statat(
-            &src_fd,
+            src_fd,
             name,
             rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
         ) {
@@ -1358,12 +1466,53 @@ fn copy_dir(
         });
     }
 
-    drop(dir);
+    dirents.sort_by(|a, b| a.dtype.cmp(&b.dtype).then_with(|| a.name.cmp(&b.name)));
+    Ok(dirents)
+}
 
-    // Sort by (type, name)
-    dirents.sort_by(|a, b| {
-        a.dtype.cmp(&b.dtype).then_with(|| a.name.cmp(&b.name))
-    });
+fn skip_source_entry(s: &CopyFsState, d: &DirEntryInfo) -> bool {
+    (d.name.to_bytes() == b"."
+        || d.name.to_bytes() == b".."
+        || d.name.to_bytes() == b"lost+found")
+        || (s.migrate_type == MigrateType::Migrate && d.stat.st_ino as u64 == s.bcachefs_inum)
+}
+
+fn count_source_entries(s: &CopyFsState, src_fd: OwnedFd) -> Result<u64, BchError> {
+    let mut entries: u64 = 0;
+    let oflags = rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOATIME;
+
+    for d in source_dirents(&src_fd)? {
+        s.check_cancellation()?;
+        if skip_source_entry(s, &d) {
+            continue;
+        }
+        if s.migrate_type == MigrateType::Migrate && d.stat.st_dev != s.dev {
+            return Err(BchError::from_raw(-libc::EINVAL));
+        }
+
+        entries = entries
+            .checked_add(1)
+            .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+        if mode_to_type(d.stat.st_mode) == DT_DIR {
+            let fd = rustix::fs::openat(&src_fd, &d.name, oflags, rustix::fs::Mode::empty())
+                .map_err(rustix_err)?;
+            entries = entries
+                .checked_add(count_source_entries(s, fd)?)
+                .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+        }
+    }
+
+    Ok(entries)
+}
+
+fn copy_dir(
+    fs: &Fs,
+    s: &mut CopyFsState,
+    dst: &mut c::bch_inode_unpacked,
+    src_fd: OwnedFd,
+    src_path: &CStr,
+) -> Result<(), BchError> {
+    let dirents = source_dirents(&src_fd)?;
 
     let dir_inum = subvol_inum(dst.bi_inum);
 
@@ -1372,18 +1521,16 @@ fn copy_dir(
     let oflags = rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOATIME;
 
     for d in &dirents {
+        s.check_cancellation()?;
         rustix::process::fchdir(&src_fd).map_err(rustix_err)?;
 
         let name_str = d.name.to_str().unwrap_or("?");
-        if name_str == "." || name_str == ".." || name_str == "lost+found" {
-            continue;
-        }
-
-        if s.migrate_type == MigrateType::Migrate && d.stat.st_ino as u64 == s.bcachefs_inum {
+        if skip_source_entry(s, d) {
             continue;
         }
 
         s.total_files += 1;
+        let is_directory = mode_to_type(d.stat.st_mode) == DT_DIR;
 
         let child_path = CString::new(format!(
             "{}/{}",
@@ -1404,6 +1551,7 @@ fn copy_dir(
                     fs, dir_inum, dst, &d.name,
                     subvol_inum(dst_ino),
                 )?;
+                s.finish_entry(fs, false)?;
                 continue;
             }
         }
@@ -1454,6 +1602,7 @@ fn copy_dir(
 
         copy_times(fs, &mut inode, &d.stat);
         update_inode(fs, &inode)?;
+        s.finish_entry(fs, is_directory)?;
     }
 
     Ok(())
@@ -1466,6 +1615,7 @@ fn first_device_total_sectors(fs: &Fs) -> u64 {
 
 fn reserve_old_fs_space(
     fs: &Fs,
+    cancellation_probe: Option<fn() -> bool>,
     root_inode: &mut c::bch_inode_unpacked,
     extents: &mut Vec<(u64, u64)>,
     reserve_start: u64,
@@ -1483,6 +1633,7 @@ fn reserve_old_fs_space(
     ranges_sort_merge(extents);
 
     for_each_hole(extents, total_sectors << 9, |hole_start, hole_end| {
+        check_cancellation_probe(cancellation_probe)?;
         if hole_end <= reserve_start {
             return Ok(());
         }
@@ -1512,6 +1663,10 @@ pub fn copy_fs(
         rustix::fs::syncfs(src_fd).map_err(rustix_err)?;
     }
 
+    let prepass_fd = rustix::io::dup(src_fd).map_err(rustix_err)?;
+    let entries_total = count_source_entries(s, prepass_fd)?;
+    s.start_progress(fs, entries_total);
+
     let mut root_inode = inode::find_by_inum(fs, root_subvol_inum())?;
 
     rustix::process::fchdir(src_fd).map_err(rustix_err)?;
@@ -1525,10 +1680,19 @@ pub fn copy_fs(
     copy_dir(fs, s, &mut root_inode, dup_fd, src_path)?;
 
     if s.migrate_type == MigrateType::Migrate {
-        reserve_old_fs_space(fs, &mut root_inode, &mut s.extents, s.reserve_start)?;
+        let cancellation_probe = s.cancellation_probe;
+        let reserve_start = s.reserve_start;
+        reserve_old_fs_space(
+            fs,
+            cancellation_probe,
+            &mut root_inode,
+            &mut s.extents,
+            reserve_start,
+        )?;
     }
 
     update_inode(fs, &root_inode)?;
+    s.finish_progress(fs);
 
     // Print summary
     println!("Total files:\t{}", s.total_files);
@@ -1590,6 +1754,14 @@ fn print_human_readable(bytes: u64) {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn emits_progress_after_interval_without_completed_entries() {
+        let mut state = CopyFsState::new_migrate(1, 1, 0, ExtentMapper::Identity);
+        state.progress_last_emitted = Instant::now() - PROGRESS_INTERVAL;
+
+        assert!(state.should_emit_progress());
+    }
     #[test]
     fn translates_btrfs_logical_segment_to_file_offset() {
         let segment = PhysicalSegment {
