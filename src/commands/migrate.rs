@@ -15,6 +15,7 @@ use std::ffi::{CString, c_char, c_ulong};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -36,6 +37,10 @@ use crate::btrfs_migrate::{
     preflight_source, BtrfsPreflight, ExtentMapper, BTRFS_BLOCK_GROUP_DATA_MASK,
 };
 use crate::wrappers::super_io;
+use crate::migration_copy_policy::{
+    classify_extent, classify_segment, CopyAccounting, CopyReason, ExtentDisposition,
+    MigrationCopyPolicy,
+};
 
 // ---- C shim declarations ----
 
@@ -89,6 +94,7 @@ fn return_if_migrate_cancelled() -> Result<()> {
 
 extern "C" {
     fn rust_set_bit(nr: c_ulong, addr: *mut c_ulong);
+    fn rust_count_set_bits(addr: *const c_ulong, nbits: c_ulong) -> c_ulong;
     fn bch2_test_key_cache_going_ro_abort_dirty(fs: *mut c::bch_fs, nr: u64) -> i32;
     fn bch2_test_key_cache_going_ro_abort_ready(fs: *mut c::bch_fs);
 }
@@ -374,6 +380,84 @@ fn ensure_usable_reservation_capacity(capacity: &ReservationCapacity) -> Result<
     Ok(())
 }
 
+const MIN_MIGRATION_ALLOCATOR_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
+const MIGRATION_ALLOCATOR_HEADROOM_FRACTION: u64 = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CopyFeasibility {
+    allocator_headroom_bytes: u64,
+    required_bytes: u64,
+    fits: bool,
+}
+
+fn copy_feasibility(capacity: &ReservationCapacity, predicted_copy_bytes: u64) -> CopyFeasibility {
+    let allocator_headroom_bytes = (capacity.usable_full_bucket_bytes
+        / MIGRATION_ALLOCATOR_HEADROOM_FRACTION)
+        .max(MIN_MIGRATION_ALLOCATOR_HEADROOM_BYTES)
+        .min(capacity.usable_full_bucket_bytes);
+    let required_bytes = predicted_copy_bytes.saturating_add(allocator_headroom_bytes);
+    CopyFeasibility {
+        allocator_headroom_bytes,
+        required_bytes,
+        fits: required_bytes <= capacity.usable_full_bucket_bytes,
+    }
+}
+
+fn print_copy_reasons(mode: &str, copied: &CopyAccounting) -> Result<()> {
+    if !copied.is_consistent() {
+        bail!(
+            "copy reason accounting is inconsistent (copied_bytes={}, reason_sum={})",
+            copied.copied_bytes,
+            copied.reason_sum()
+        );
+    }
+    println!(
+        "MIGRATE_COPY_REASONS mode={} copied_bytes={} copied_shared_bytes={} copied_inline_bytes={} copied_encoded_bytes={} copied_encrypted_bytes={} copied_not_aligned_bytes={} copied_tail_bytes={} copied_merged_bytes={} copied_future_flags_bytes={} copied_reservation_overlap_bytes={} copied_raw_unaligned_bytes={} copied_raw_mapping_unavailable_bytes={} copied_unstable_bytes={} copied_symlink_bytes={} copied_other_bytes={}",
+        mode,
+        copied.copied_bytes,
+        copied.shared,
+        copied.inline,
+        copied.encoded,
+        copied.encrypted,
+        copied.not_aligned,
+        copied.tail,
+        copied.merged,
+        copied.future_flags,
+        copied.reservation_overlap,
+        copied.raw_unaligned,
+        copied.raw_mapping_unavailable,
+        copied.unstable,
+        copied.symlink,
+        copied.other,
+    );
+    Ok(())
+}
+
+fn ensure_copy_feasibility(
+    capacity: &ReservationCapacity,
+    predicted_copy_bytes: u64,
+) -> Result<CopyFeasibility> {
+    let feasibility = copy_feasibility(capacity, predicted_copy_bytes);
+    println!(
+        "MIGRATE_COPY_FEASIBILITY verdict={} predicted_copy_bytes={} reservation_usable_full_bucket_bytes={} allocator_headroom_bytes={} required_bytes={}",
+        if feasibility.fits { "fit" } else { "reject" },
+        predicted_copy_bytes,
+        capacity.usable_full_bucket_bytes,
+        feasibility.allocator_headroom_bytes,
+        feasibility.required_bytes,
+    );
+    if !feasibility.fits && std::env::var_os("BCACHEFS_TEST_BYPASS_COPY_FEASIBILITY").is_none() {
+        bail!(
+            "migration copy preflight requires {} bytes ({} copied + {} allocator headroom), but the reservation exposes only {} allocatable bytes",
+            feasibility.required_bytes,
+            predicted_copy_bytes,
+            feasibility.allocator_headroom_bytes,
+            capacity.usable_full_bucket_bytes,
+        );
+    }
+    Ok(feasibility)
+}
+
 fn print_reservation_capacity(capacity: &ReservationCapacity) {
     println!(
         "MIGRATE_RESERVATION reservation_raw_extent_count={} reservation_raw_bytes={} reservation_bucket_size_bytes={} reservation_usable_full_bucket_count={} reservation_usable_full_bucket_bytes={} reservation_bucket_alignment_loss_bytes={} reservation_default_superblock_protected_bytes={} reservation_device_tail_bytes={}",
@@ -507,6 +591,48 @@ unsafe fn mark_unreserved_space(fs: *mut c::bch_fs, extents: &[CRange]) -> Resul
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReservationNouseState {
+    total_bucket_count: u64,
+    excluded_bucket_count: u64,
+    allocatable_bucket_count: u64,
+    allocatable_bytes: u64,
+}
+
+unsafe fn reservation_nouse_state(fs: *mut c::bch_fs) -> Result<ReservationNouseState> {
+    let ca = (*fs).devs[0];
+    if ca.is_null() || (*ca).buckets_nouse.is_null() {
+        bail!("candidate buckets_nouse bitmap is unavailable");
+    }
+    let total_bucket_count = (*ca).mi.nbuckets;
+    let excluded_bucket_count = u64::try_from(rust_count_set_bits(
+        (*ca).buckets_nouse,
+        c_ulong::try_from(total_bucket_count)
+            .map_err(|_| anyhow!("candidate bucket count exceeds c_ulong"))?,
+    ))
+    .map_err(|_| anyhow!("candidate nouse bucket count overflows u64"))?;
+    if excluded_bucket_count > total_bucket_count {
+        bail!(
+            "candidate nouse bitmap count exceeds device buckets ({} > {})",
+            excluded_bucket_count,
+            total_bucket_count
+        );
+    }
+    let allocatable_bucket_count = total_bucket_count - excluded_bucket_count;
+    let bucket_bytes = u64::from((*ca).mi.bucket_size)
+        .checked_shl(9)
+        .ok_or_else(|| anyhow!("candidate bucket size overflows"))?;
+    let allocatable_bytes = allocatable_bucket_count
+        .checked_mul(bucket_bytes)
+        .ok_or_else(|| anyhow!("candidate allocatable byte count overflows"))?;
+    Ok(ReservationNouseState {
+        total_bucket_count,
+        excluded_bucket_count,
+        allocatable_bucket_count,
+        allocatable_bytes,
+    })
 }
 
 /// Reserve space for bcachefs metadata file, return extents, inode number, and
@@ -829,6 +955,48 @@ fn migration_block_alignment(raw_device_path: &Path, raw_device_size: u64) -> u6
     }
 }
 
+fn configure_migration_device(
+    fs_opts: &mut c::bch_opts,
+    c_dev: &mut DevOpts,
+    superblock_size: u32,
+) -> Result<(ReservationGeometry, MigrationCopyPolicy)> {
+    c_dev.fs_size = crate::wrappers::bdev::get_size(c_dev.fd());
+
+    let block_size =
+        crate::commands::format_util::pick_block_size(fs_opts, std::slice::from_ref(c_dev));
+    opt_set!(fs_opts, block_size, block_size as u16);
+
+    let bucket_size =
+        crate::commands::format_util::pick_bucket_size(fs_opts, std::slice::from_ref(c_dev));
+    {
+        let dev_opts = &mut c_dev.opts;
+        opt_set!(dev_opts, bucket_size, bucket_size as u32);
+    }
+    c_dev.nbuckets = c_dev.fs_size / c_dev.opts.bucket_size as u64;
+    crate::commands::format_util::check_bucket_size(fs_opts, c_dev);
+
+    let geometry = reservation_geometry(
+        c_dev
+            .nbuckets
+            .checked_mul(c_dev.opts.bucket_size as u64)
+            .ok_or_else(|| anyhow!("reservation device size overflows"))?,
+        c_dev.opts.bucket_size as u64,
+        superblock_size as u64,
+    )?;
+    let reserved_superblock_end = geometry
+        .default_superblock_end
+        .div_ceil(geometry.bucket_bytes)
+        .checked_mul(geometry.bucket_bytes)
+        .ok_or_else(|| anyhow!("reserved superblock range overflows"))?;
+    Ok((
+        geometry,
+        MigrationCopyPolicy {
+            block_bytes: u64::from(block_size),
+            reserved_superblock_end,
+        },
+    ))
+}
+
 fn inspect_source(fs_path: &Path) -> Result<SourceInfo> {
     if !path_is_fs_root(fs_path.to_string_lossy().as_ref())? {
         bail!("{} is not a filesystem root", fs_path.display());
@@ -913,18 +1081,6 @@ fn path_is_btrfs(path: &Path) -> Result<bool> {
     Ok(unsafe { stat.assume_init() }.f_type as u64 == BTRFS_SUPER_MAGIC)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NoChangeCopyReason {
-    Shared,
-    Encoded,
-    Encrypted,
-    NotAligned,
-    Inline,
-    Tail,
-    Merged,
-    FutureFlags,
-    RawUnaligned,
-}
 
 #[derive(Default)]
 struct NoChangeStats {
@@ -934,94 +1090,27 @@ struct NoChangeStats {
     special: u64,
     total_input: u64,
     linked: u64,
-    copied: u64,
     unwritten: u64,
     unstable: u64,
     mapped_extents: u64,
     mapped_segments: u64,
     chunk_splits: u64,
-    copied_shared: u64,
-    copied_encoded: u64,
-    copied_encrypted: u64,
-    copied_not_aligned: u64,
-    copied_inline: u64,
-    copied_tail: u64,
-    copied_merged: u64,
-    copied_future_flags: u64,
-    copied_other_flag: u64,
-    copied_raw_unaligned: u64,
+    copy_accounting: CopyAccounting,
     mapping_failures: u64,
-    reservation_bytes: u64,
-    free_bytes: u64,
-    reservation_margin_bytes: u64,
-    capacity_valid: bool,
     eligible: bool,
 }
 
 impl NoChangeStats {
-    fn record_copy(&mut self, reason: NoChangeCopyReason, bytes: u64) {
-        self.copied = self.copied.saturating_add(bytes);
-        match reason {
-            NoChangeCopyReason::Encoded => self.copied_encoded += bytes,
-            NoChangeCopyReason::Encrypted => self.copied_encrypted += bytes,
-            NoChangeCopyReason::Shared => self.copied_shared += bytes,
-            NoChangeCopyReason::NotAligned => self.copied_not_aligned += bytes,
-            NoChangeCopyReason::Inline => {
-                self.copied_inline += bytes;
-            }
-            NoChangeCopyReason::Tail => {
-                self.copied_tail += bytes;
-                self.copied_other_flag += bytes;
-            }
-            NoChangeCopyReason::Merged => {
-                self.copied_merged += bytes;
-                self.copied_other_flag += bytes;
-            }
-            NoChangeCopyReason::FutureFlags => {
-                self.copied_future_flags += bytes;
-                self.copied_other_flag += bytes;
-            }
-            NoChangeCopyReason::RawUnaligned => self.copied_raw_unaligned += bytes,
-        }
-    }
-}
-
-fn no_change_copy_reason(flags: fiemap::FiemapExtentFlags) -> Option<NoChangeCopyReason> {
-    let known = FiemapExtentFlags::LAST
-        | FiemapExtentFlags::UNKNOWN
-        | FiemapExtentFlags::DELALLOC
-        | FiemapExtentFlags::ENCODED
-        | FiemapExtentFlags::DATA_ENCRYPTED
-        | FiemapExtentFlags::NOT_ALIGNED
-        | FiemapExtentFlags::DATA_INLINE
-        | FiemapExtentFlags::DATA_TAIL
-        | FiemapExtentFlags::UNWRITTEN
-        | FiemapExtentFlags::MERGED
-        | FiemapExtentFlags::SHARED;
-    if flags.contains(FiemapExtentFlags::ENCODED) {
-        Some(NoChangeCopyReason::Encoded)
-    } else if flags.contains(FiemapExtentFlags::DATA_ENCRYPTED) {
-        Some(NoChangeCopyReason::Encrypted)
-    } else if flags.contains(FiemapExtentFlags::SHARED) {
-        Some(NoChangeCopyReason::Shared)
-    } else if flags.contains(FiemapExtentFlags::DATA_INLINE) {
-        Some(NoChangeCopyReason::Inline)
-    } else if flags.contains(FiemapExtentFlags::DATA_TAIL) {
-        Some(NoChangeCopyReason::Tail)
-    } else if flags.contains(FiemapExtentFlags::NOT_ALIGNED) {
-        Some(NoChangeCopyReason::NotAligned)
-    } else if flags.contains(FiemapExtentFlags::MERGED) {
-        Some(NoChangeCopyReason::Merged)
-    } else if flags.bits() & !known.bits() != 0 {
-        Some(NoChangeCopyReason::FutureFlags)
-    } else {
-        None
+    fn record_copy(&mut self, reason: CopyReason, bytes: u64) {
+        self.copy_accounting.record(reason, bytes);
     }
 }
 
 fn scan_no_change_file(
     path: &Path,
     source: &SourceInfo,
+    mapper: &ExtentMapper,
+    policy: MigrationCopyPolicy,
     stats: &mut NoChangeStats,
 ) -> Result<()> {
     let file = OpenOptions::new()
@@ -1052,7 +1141,7 @@ fn scan_no_change_file(
             .checked_add(extent.fe_length)
             .ok_or_else(|| anyhow!("no-change input byte counter overflow"))?;
 
-        if extent.fe_flags.intersects(FiemapExtentFlags::UNKNOWN | FiemapExtentFlags::DELALLOC) {
+        if matches!(classify_extent(extent.fe_flags), ExtentDisposition::Unstable) {
             stats.unstable = stats
                 .unstable
                 .checked_add(extent.fe_length)
@@ -1061,9 +1150,9 @@ fn scan_no_change_file(
             continue;
         }
 
-        let src_max = metadata.len().div_ceil(source.raw_alignment);
+        let src_max = metadata.len().div_ceil(policy.block_bytes);
         let src_max = src_max
-            .checked_mul(source.raw_alignment)
+            .checked_mul(policy.block_bytes)
             .ok_or_else(|| anyhow!("no-change source extent bound overflow"))?;
         if extent.fe_logical > src_max {
             bail!(
@@ -1080,31 +1169,32 @@ fn scan_no_change_file(
             (metadata.len() - extent.fe_logical).min(length)
         };
 
-        if extent.fe_flags.contains(FiemapExtentFlags::UNWRITTEN) {
-            stats.unwritten = stats
-                .unwritten
-                .checked_add(visible_len)
-                .ok_or_else(|| anyhow!("no-change unwritten byte counter overflow"))?;
-            continue;
-        }
-        if let Some(reason) = no_change_copy_reason(extent.fe_flags) {
-            stats.record_copy(reason, visible_len);
-            continue;
+        match classify_extent(extent.fe_flags) {
+            ExtentDisposition::Hole => {
+                stats.unwritten = stats
+                    .unwritten
+                    .checked_add(visible_len)
+                    .ok_or_else(|| anyhow!("no-change unwritten byte counter overflow"))?;
+                continue;
+            }
+            ExtentDisposition::Copy(reason) => {
+                stats.record_copy(reason, visible_len);
+                continue;
+            }
+            ExtentDisposition::Unstable => unreachable!(),
+            ExtentDisposition::Link => {}
         }
 
-        let segments = match source
-            .mapper
-            .map_physical(extent.fe_physical, length)
-        {
+        let segments = match mapper.map_physical(extent.fe_physical, length) {
             Ok(segments) => segments,
             Err(error) => {
                 eprintln!(
-                    "no-change cannot map {} logical extent: {}",
+                    "no-change cannot map {} logical extent; copying instead: {}",
                     path.display(),
                     error
                 );
                 stats.mapping_failures = stats.mapping_failures.saturating_add(1);
-                stats.eligible = false;
+                stats.record_copy(CopyReason::RawMappingUnavailable, visible_len);
                 continue;
             }
         };
@@ -1116,31 +1206,49 @@ fn scan_no_change_file(
             .chunk_splits
             .saturating_add((segments.len() as u64).saturating_sub(1));
 
-        let mut raw_aligned = true;
-        for segment in &segments {
+        let extent_end = extent
+            .fe_logical
+            .checked_add(visible_len)
+            .ok_or_else(|| anyhow!("no-change file extent end overflows"))?;
+        for segment in segments {
             let segment_file_logical = segment
                 .source_logical
                 .checked_sub(extent.fe_physical)
                 .and_then(|delta| extent.fe_logical.checked_add(delta))
                 .ok_or_else(|| anyhow!("no-change file offset translation overflow"))?;
-            if (segment_file_logical | segment.physical | segment.len)
-                & (source.raw_alignment - 1)
-                != 0
-            {
-                raw_aligned = false;
-                break;
+            let segment_file_end = segment_file_logical
+                .checked_add(segment.len)
+                .ok_or_else(|| anyhow!("no-change segment end overflows"))?;
+            let copy_start = segment_file_logical.max(extent.fe_logical);
+            let copy_end = segment_file_end.min(extent_end);
+            let copy_len = copy_end.saturating_sub(copy_start);
+            if copy_len == 0 {
+                continue;
             }
-        }
-        if raw_aligned {
-            stats.linked = stats.linked.saturating_add(visible_len);
-        } else {
-            stats.record_copy(NoChangeCopyReason::RawUnaligned, visible_len);
+            let physical_offset = copy_start
+                .checked_sub(segment_file_logical)
+                .ok_or_else(|| anyhow!("no-change physical offset underflows"))?;
+            let link_physical = segment
+                .physical
+                .checked_add(physical_offset)
+                .ok_or_else(|| anyhow!("no-change physical offset overflows"))?;
+            if let Some(reason) = classify_segment(copy_start, link_physical, copy_len, policy) {
+                stats.record_copy(reason, copy_len);
+            } else {
+                stats.linked = stats.linked.saturating_add(copy_len);
+            }
         }
     }
     Ok(())
 }
 
-fn scan_no_change_tree(source_path: &Path, source: &SourceInfo) -> Result<NoChangeStats> {
+fn scan_no_change_tree(
+    source_path: &Path,
+    source: &SourceInfo,
+    mapper: &ExtentMapper,
+    policy: MigrationCopyPolicy,
+    skipped_inode: Option<u64>,
+) -> Result<NoChangeStats> {
     let mut stats = NoChangeStats {
         eligible: true,
         ..Default::default()
@@ -1179,11 +1287,17 @@ fn scan_no_change_tree(source_path: &Path, source: &SourceInfo) -> Result<NoChan
             if file_type.is_dir() {
                 directories.push(child);
             } else if file_type.is_symlink() {
+                let target = fs::read_link(&child)
+                    .map_err(|e| anyhow!("cannot read symbolic link {}: {}", child.display(), e))?;
                 stats.symlinks = stats.symlinks.saturating_add(1);
+                stats.record_copy(CopyReason::Symlink, target.as_os_str().as_bytes().len() as u64);
             } else if file_type.is_file() {
+                if skipped_inode == Some(child_meta.ino()) {
+                    continue;
+                }
                 stats.files = stats.files.saturating_add(1);
                 if seen_files.insert((child_meta.dev(), child_meta.ino())) {
-                    scan_no_change_file(&child, source, &mut stats)?;
+                    scan_no_change_file(&child, source, mapper, policy, &mut stats)?;
                 }
             } else {
                 stats.special = stats.special.saturating_add(1);
@@ -1193,28 +1307,7 @@ fn scan_no_change_tree(source_path: &Path, source: &SourceInfo) -> Result<NoChan
     Ok(stats)
 }
 
-const MIN_RESERVATION_MARGIN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-fn no_change_capacity(source_path: &Path, source: &SourceInfo) -> Result<(u64, u64, u64, bool)> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(source_path)
-        .map_err(|e| anyhow!("cannot open {} for statfs: {}", source_path.display(), e))?;
-    let vfs = rustix::fs::fstatvfs(&file).map_err(|e| anyhow!("fstatvfs: {}", e))?;
-    let free_bytes = vfs.f_bavail.saturating_mul(vfs.f_frsize);
-    let reservation_bytes = source.raw_device_size / 10;
-    let reservation_margin_bytes = free_bytes.saturating_sub(reservation_bytes);
-    let valid = source.raw_device_size != 0
-        && free_bytes >= reservation_bytes
-        && reservation_margin_bytes >= MIN_RESERVATION_MARGIN_BYTES;
-    Ok((
-        reservation_bytes,
-        free_bytes,
-        reservation_margin_bytes,
-        valid,
-    ))
-}
 
 fn print_preflight(source_path: &Path, source: &SourceInfo) {
     if let Some(btrfs) = &source.btrfs {
@@ -1248,74 +1341,92 @@ fn print_preflight(source_path: &Path, source: &SourceInfo) {
     }
 }
 
-fn print_no_change_plan(stats: &NoChangeStats) {
+fn print_no_change_plan(stats: &NoChangeStats) -> Result<()> {
+    let copied = &stats.copy_accounting;
+    print_copy_reasons("no-change", copied)?;
     println!(
-        "MIGRATE_PLAN mode=no-change directories={} files={} symlinks={} special={} total_input_bytes={} linked_bytes={} copied_bytes={} copied_shared_bytes={} copied_encoded_bytes={} copied_encrypted_bytes={} copied_inline_bytes={} copied_not_aligned_bytes={} copied_other_flag_bytes={} unwritten_hole_bytes={} unstable_extent_bytes={} mapped_extent_count={} mapped_segment_count={} chunk_split_count={} copied_tail_bytes={} copied_merged_bytes={} copied_future_flags_bytes={} copied_raw_unaligned_bytes={} mapping_failures={} reservation_bytes={} free_bytes={} reservation_margin_bytes={}",
+        "MIGRATE_PLAN mode=no-change directories={} files={} symlinks={} special={} total_input_bytes={} linked_bytes={} copied_bytes={} copied_shared_bytes={} copied_inline_bytes={} copied_encoded_bytes={} copied_encrypted_bytes={} copied_not_aligned_bytes={} copied_tail_bytes={} copied_merged_bytes={} copied_future_flags_bytes={} copied_reservation_overlap_bytes={} copied_raw_unaligned_bytes={} copied_raw_mapping_unavailable_bytes={} copied_unstable_bytes={} copied_symlink_bytes={} copied_other_bytes={} unwritten_hole_bytes={} unstable_extent_bytes={} mapped_extent_count={} mapped_segment_count={} chunk_split_count={} mapping_failures={}",
         stats.directories,
         stats.files,
         stats.symlinks,
         stats.special,
         stats.total_input,
         stats.linked,
-        stats.copied,
-        stats.copied_shared,
-        stats.copied_encoded,
-        stats.copied_encrypted,
-        stats.copied_inline,
-        stats.copied_not_aligned,
-        stats.copied_other_flag,
+        copied.copied_bytes,
+        copied.shared,
+        copied.inline,
+        copied.encoded,
+        copied.encrypted,
+        copied.not_aligned,
+        copied.tail,
+        copied.merged,
+        copied.future_flags,
+        copied.reservation_overlap,
+        copied.raw_unaligned,
+        copied.raw_mapping_unavailable,
+        copied.unstable,
+        copied.symlink,
+        copied.other,
         stats.unwritten,
         stats.unstable,
         stats.mapped_extents,
         stats.mapped_segments,
         stats.chunk_splits,
-        stats.copied_tail,
-        stats.copied_merged,
-        stats.copied_future_flags,
-        stats.copied_raw_unaligned,
         stats.mapping_failures,
-        stats.reservation_bytes,
-        stats.free_bytes,
-        stats.reservation_margin_bytes,
     );
+    Ok(())
 }
 
-fn run_no_change(source_path: &Path, source: &SourceInfo) -> Result<()> {
-    let (reservation_bytes, free_bytes, reservation_margin_bytes, capacity_valid) =
-        match no_change_capacity(source_path, source) {
-            Ok(capacity) => capacity,
-            Err(error) => {
-                println!("MIGRATE_RESULT eligible=no");
-                return Err(error);
-            }
-        };
+fn run_no_change(
+    source_path: &Path,
+    source: &SourceInfo,
+    mut fs_opts: c::bch_opts,
+    superblock_size: u32,
+    force: bool,
+) -> Result<()> {
+    let dev_path = source.raw_device_path.to_string_lossy().into_owned();
+    let mut c_dev = DevOpts::new(CString::new(dev_path.as_str())?);
+    c_dev.open_no_blkid(
+        crate::wrappers::bdev::BLK_OPEN_READ | crate::wrappers::bdev::BLK_OPEN_BUFFERED,
+    )
+    .map_err(|e| {
+        anyhow!(
+            "Error opening device to plan migration {}: {}",
+            dev_path,
+            io::Error::from_raw_os_error(e)
+        )
+    })?;
+    let (_, policy) = configure_migration_device(&mut fs_opts, &mut c_dev, superblock_size)?;
     println!(
-        "MIGRATE_PREFLIGHT reservation_bytes={} free_bytes={} reservation_margin_bytes={} reservation_margin_required_bytes={} capacity_valid={}",
-        reservation_bytes,
-        free_bytes,
-        reservation_margin_bytes,
-        MIN_RESERVATION_MARGIN_BYTES,
-        if capacity_valid { "yes" } else { "no" },
+        "MIGRATE_COPY_POLICY mode=no-change candidate_block_bytes={} reserved_superblock_end={}",
+        policy.block_bytes,
+        policy.reserved_superblock_end,
     );
-    let mut stats = match scan_no_change_tree(source_path, source) {
+    let mapper = refresh_source_mapper(source_path, source)?;
+    let skipped_inode = if force {
+        let reservation_path = source_path.join("bcachefs");
+        fs::symlink_metadata(&reservation_path)
+            .ok()
+            .filter(|metadata| metadata.file_type().is_file())
+            .map(|metadata| metadata.ino())
+    } else {
+        None
+    };
+    let stats = match scan_no_change_tree(source_path, source, &mapper, policy, skipped_inode) {
         Ok(stats) => stats,
         Err(error) => {
             println!("MIGRATE_RESULT eligible=no");
             return Err(error);
         }
     };
-    stats.reservation_bytes = reservation_bytes;
-    stats.free_bytes = free_bytes;
-    stats.reservation_margin_bytes = reservation_margin_bytes;
-    stats.capacity_valid = capacity_valid;
-    print_no_change_plan(&stats);
-    let eligible = stats.eligible && stats.mapping_failures == 0 && stats.capacity_valid;
+    print_no_change_plan(&stats)?;
+    let eligible = stats.eligible;
     println!(
         "MIGRATE_RESULT eligible={}",
         if eligible { "yes" } else { "no" }
     );
     if !eligible {
-        bail!("no-change preflight found unstable, unmappable, or insufficient-space conditions");
+        bail!("no-change preflight found unstable source extents");
     }
     Ok(())
 }
@@ -1391,34 +1502,17 @@ fn migrate_fs(
     let file_path = format!("{}/bcachefs", fs_path);
     println!("Creating new filesystem on {} in space reserved at {}", dev_path, file_path);
 
-    let dev_size = crate::wrappers::bdev::get_size(c_dev.fd());
-    c_dev.fs_size = dev_size;
 
-    let block_size = crate::commands::format_util::pick_block_size(&fs_opts, std::slice::from_ref(&c_dev));
-    opt_set!(fs_opts, block_size, block_size as u16);
-
-    let bucket_size = crate::commands::format_util::pick_bucket_size(&fs_opts, std::slice::from_ref(&c_dev));
-    {
-        let dev_opts = &mut c_dev.opts;
-        opt_set!(dev_opts, bucket_size, bucket_size as u32);
-    }
-    c_dev.nbuckets = c_dev.fs_size / c_dev.opts.bucket_size as u64;
-
-    crate::commands::format_util::check_bucket_size(&fs_opts, &c_dev);
-
-    let reservation_geometry = reservation_geometry(
-        c_dev
-            .nbuckets
-            .checked_mul(c_dev.opts.bucket_size as u64)
-            .ok_or_else(|| anyhow!("reservation device size overflows"))?,
-        c_dev.opts.bucket_size as u64,
-        format_opts.superblock_size as u64,
-    )?;
+    let (reservation_geometry, migration_policy) =
+        configure_migration_device(&mut fs_opts, &mut c_dev, format_opts.superblock_size)?;
+    let dev_size = c_dev.fs_size;
+    let block_size = migration_policy.block_bytes;
 
     // Reserve space for bcachefs metadata — grab as much as we can
-    let (extents, bcachefs_inum, refreshed_mapper) = reserve_new_fs_space(
+    let (extents, bcachefs_inum, _reservation_mapper) = reserve_new_fs_space(
         &file_path,
-        block_size >> 9,
+        u32::try_from(block_size >> 9)
+            .map_err(|_| anyhow!("migration block size exceeds u32 sectors"))?,
         dev_size,
         fs_dev,
         force,
@@ -1429,6 +1523,23 @@ fn migrate_fs(
     print_reservation_capacity(&reservation_capacity);
     ensure_usable_reservation_capacity(&reservation_capacity)?;
 
+    rustix::fs::syncfs(fs_file.as_fd())
+        .map_err(|e| anyhow!("Error syncing source before migration preflight: {}", e))?;
+    let refreshed_mapper = refresh_source_mapper(Path::new(fs_path), &source)?;
+    let preflight_stats = scan_no_change_tree(
+        Path::new(fs_path),
+        &source,
+        &refreshed_mapper,
+        migration_policy,
+        Some(bcachefs_inum),
+    )?;
+    print_copy_reasons("preflight", &preflight_stats.copy_accounting)?;
+    if !preflight_stats.eligible {
+        println!("MIGRATE_COPY_FEASIBILITY verdict=reject reason=unstable_extent");
+        bail!("migration copy preflight found unstable source extents after sync");
+    }
+    let _copy_feasibility =
+        ensure_copy_feasibility(&reservation_capacity, preflight_stats.copy_accounting.copied_bytes)?;
 
     // Find superblock location within reserved extents
     let (sb_offset, sb_end) = find_superblock_space(
@@ -1440,9 +1551,8 @@ fn migrate_fs(
     c_dev.sb_end = sb_end;
 
     // format() consumes format_opts (it's no longer Copy — has a blocklisted
-    // bch_opts field), so capture the fields used afterward first.
+    // bch_opts field), so capture the passphrase pointer first.
     let passphrase = format_opts.passphrase;
-    let superblock_size = format_opts.superblock_size;
 
     let sb = crate::commands::format_util::format(fs_opt_strs, fs_opts, format_opts, std::slice::from_mut(&mut c_dev));
     if sb.is_null() {
@@ -1471,11 +1581,38 @@ fn migrate_fs(
 
     let fs = Fs::open(std::slice::from_ref(&dev_path_pb), opts)
         .map_err(|e| anyhow!("Error opening new filesystem: {}", e))?;
+    if fs.block_bytes() != migration_policy.block_bytes {
+        bail!(
+            "candidate block size changed after format (planned {} bytes, actual {} bytes)",
+            migration_policy.block_bytes,
+            fs.block_bytes(),
+        );
+    }
+    println!(
+        "MIGRATE_COPY_POLICY mode=migrate candidate_block_bytes={} reserved_superblock_end={}",
+        migration_policy.block_bytes,
+        migration_policy.reserved_superblock_end,
+    );
 
     fs.buckets_nouse_alloc()
         .map_err(|e| anyhow!("Error allocating buckets_nouse: {}", e))?;
 
     unsafe { mark_unreserved_space(fs.raw, &extents) }?;
+    let nouse_state = unsafe { reservation_nouse_state(fs.raw) }?;
+    println!(
+        "MIGRATE_RESERVATION_NOUSE reservation_total_bucket_count={} reservation_nouse_excluded_bucket_count={} reservation_allocatable_bucket_count={} reservation_allocatable_bytes={}",
+        nouse_state.total_bucket_count,
+        nouse_state.excluded_bucket_count,
+        nouse_state.allocatable_bucket_count,
+        nouse_state.allocatable_bytes,
+    );
+    if nouse_state.allocatable_bytes != reservation_capacity.usable_full_bucket_bytes {
+        bail!(
+            "candidate nouse bitmap exposes {} allocatable bytes, but the reservation plan computed {}",
+            nouse_state.allocatable_bytes,
+            reservation_capacity.usable_full_bucket_bytes,
+        );
+    }
 
     fs.start()
         .map_err(|e| anyhow!("Error starting new filesystem: {}", e))?;
@@ -1489,18 +1626,15 @@ fn migrate_fs(
             .map_err(|e| anyhow!("Error writing superblock: {}", e))?;
     }
 
-    // Calculate reserve_start: round up (superblock_size * 2 + BCH_SB_SECTOR) sectors
-    // to bucket boundary (in bytes)
-    let bucket_bytes = unsafe { (*(*fs.raw).devs[0]).mi.bucket_size as u64 } << 9;
-    let reserve_start = (((superblock_size as u64 * 2 + c::BCH_SB_SECTOR as u64) << 9)
-        .div_ceil(bucket_bytes)) * bucket_bytes;
-
-    // Copy the filesystem tree
+    // Copy the filesystem tree using the same candidate policy used by preflight.
     let mut s = crate::copy_fs::CopyFsState::new_migrate(
         bcachefs_inum,
         fs_dev,
-        reserve_start,
+        migration_policy.reserved_superblock_end,
         refreshed_mapper,
+        nouse_state.allocatable_bytes,
+        _copy_feasibility.allocator_headroom_bytes,
+        preflight_stats.copy_accounting.copied_bytes,
     );
     // Pre-populate with metadata reservation ranges
     for e in &extents {
@@ -1752,7 +1886,14 @@ fn cmd_migrate(argv: Vec<String>) -> Result<()> {
     };
     print_preflight(source_path, &source);
     if no_change {
-        return run_no_change(source_path, &source);
+        let format_opts = format_opts_default();
+        return run_no_change(
+            source_path,
+            &source,
+            fs_opts,
+            format_opts.superblock_size,
+            force,
+        );
     }
 
     // Build format_opts with version detection
@@ -1846,28 +1987,72 @@ mod tests {
 
 
     #[test]
-    fn no_change_classifies_every_copy_fallback_flag() {
+    fn migration_copy_policy_classifies_every_copy_fallback_flag() {
         let cases = [
-            (FiemapExtentFlags::SHARED, NoChangeCopyReason::Shared),
-            (FiemapExtentFlags::ENCODED, NoChangeCopyReason::Encoded),
-            (FiemapExtentFlags::DATA_ENCRYPTED, NoChangeCopyReason::Encrypted),
-            (FiemapExtentFlags::NOT_ALIGNED, NoChangeCopyReason::NotAligned),
-            (FiemapExtentFlags::DATA_INLINE, NoChangeCopyReason::Inline),
-            (FiemapExtentFlags::DATA_TAIL, NoChangeCopyReason::Tail),
-            (FiemapExtentFlags::MERGED, NoChangeCopyReason::Merged),
+            (FiemapExtentFlags::SHARED, CopyReason::Shared),
+            (FiemapExtentFlags::ENCODED, CopyReason::Encoded),
+            (FiemapExtentFlags::DATA_ENCRYPTED, CopyReason::Encrypted),
+            (FiemapExtentFlags::NOT_ALIGNED, CopyReason::NotAligned),
+            (FiemapExtentFlags::DATA_INLINE, CopyReason::Inline),
+            (FiemapExtentFlags::DATA_TAIL, CopyReason::Tail),
+            (FiemapExtentFlags::MERGED, CopyReason::Merged),
             (
                 FiemapExtentFlags::from_bits_retain(1 << 15),
-                NoChangeCopyReason::FutureFlags,
+                CopyReason::FutureFlags,
             ),
         ];
         for (flags, expected) in cases {
-            assert_eq!(no_change_copy_reason(flags), Some(expected));
+            assert_eq!(
+                classify_extent(flags),
+                ExtentDisposition::Copy(expected),
+            );
         }
-        assert_eq!(no_change_copy_reason(FiemapExtentFlags::empty()), None);
         assert_eq!(
-            no_change_copy_reason(FiemapExtentFlags::UNKNOWN | FiemapExtentFlags::DELALLOC),
-            None
+            classify_extent(FiemapExtentFlags::empty()),
+
+            ExtentDisposition::Link,
         );
+        assert_eq!(
+            classify_extent(FiemapExtentFlags::UNKNOWN | FiemapExtentFlags::DELALLOC),
+            ExtentDisposition::Unstable,
+        );
+    }
+    #[test]
+    fn copy_feasibility_rejects_retry_four_copy_estimate() {
+        let capacity = ReservationCapacity {
+            raw_extent_count: 0,
+            raw_bytes: 0,
+            bucket_size_bytes: 0,
+            default_superblock_protected_bytes: 0,
+            device_tail_bytes: 0,
+            bucket_alignment_loss_bytes: 0,
+            usable_full_bucket_count: 0,
+            usable_full_bucket_bytes: 54_749_298_688,
+        };
+
+        let feasibility = copy_feasibility(&capacity, 49_430_093_395);
+
+        assert_eq!(feasibility.allocator_headroom_bytes, 6_843_662_336);
+        assert_eq!(feasibility.required_bytes, 56_273_755_731);
+        assert!(!feasibility.fits);
+    }
+
+    #[test]
+    fn migration_copy_policy_reserves_default_superblock_before_alignment() {
+        let policy = MigrationCopyPolicy {
+            block_bytes: 4096,
+            reserved_superblock_end: 8192,
+        };
+
+        assert_eq!(
+            classify_segment(0, 4096, 4096, policy),
+            Some(CopyReason::ReservationOverlap),
+        );
+        assert_eq!(
+            classify_segment(0, 8192, 2048, policy),
+            Some(CopyReason::RawUnaligned),
+        );
+        assert_eq!(classify_segment(0, 8192, 4096, policy), None);
     }
 
     #[test]
@@ -2094,7 +2279,15 @@ mod tests {
             .unwrap();
 
         assert!(expected.mapper.map_physical(8192, 4096).is_err());
-        let state = crate::copy_fs::CopyFsState::new_migrate(7, 42, 0, refreshed_mapper);
+        let state = crate::copy_fs::CopyFsState::new_migrate(
+            7,
+            42,
+            0,
+            refreshed_mapper,
+            0,
+            0,
+            0,
+        );
         assert_eq!(
             state.mapper.map_physical(8192, 4096).unwrap(),
             mapper_b.map_physical(8192, 4096).unwrap()

@@ -26,6 +26,10 @@ use bcachefs_kernel::fs::Fs;
 
 use crate::util::AlignedBuf;
 use crate::btrfs_migrate::{ExtentMapper, PhysicalSegment};
+use crate::migration_copy_policy::{
+    classify_extent, classify_segment, CopyAccounting, CopyReason, ExtentDisposition,
+    MigrationCopyPolicy,
+};
 
 const BCACHEFS_ROOT_INO: u64 = 4096;
 const BCACHEFS_ROOT_SUBVOL: u64 = 1;
@@ -257,19 +261,6 @@ pub enum MigrateType {
     Copy,
     Migrate,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CopyReason {
-    Encoded,
-    Encrypted,
-    Shared,
-    NotAligned,
-    Inline,
-    Tail,
-    Merged,
-    FutureFlags,
-    Reserved,
-    RawUnaligned,
-}
 
 
 /// State for a copy_fs operation.
@@ -291,17 +282,10 @@ pub struct CopyFsState {
     pub mapped_extents: u64,
     pub mapped_segments: u64,
     pub chunk_splits: u64,
-    pub copied_shared: u64,
-    pub copied_encoded: u64,
-    pub copied_encrypted: u64,
-    pub copied_not_aligned: u64,
-    pub copied_inline: u64,
-    pub copied_tail: u64,
-    pub copied_merged: u64,
-    pub copied_future_flags: u64,
-    pub copied_other_flag: u64,
-    pub copied_reserved: u64,
-    pub copied_raw_unaligned: u64,
+    reservation_allocatable_bytes: u64,
+    reservation_allocator_headroom_bytes: u64,
+    reservation_predicted_copy_bytes: u64,
+    copy_accounting: CopyAccounting,
     entries_total: u64,
     entries_done: u64,
     // All successfully copied non-directory dirents: regular files, symlinks,
@@ -336,17 +320,10 @@ impl CopyFsState {
             mapped_extents:   0,
             mapped_segments:  0,
             chunk_splits:     0,
-            copied_shared:    0,
-            copied_encoded:   0,
-            copied_encrypted: 0,
-            copied_not_aligned: 0,
-            copied_inline:    0,
-            copied_tail:      0,
-            copied_merged:    0,
-            copied_future_flags: 0,
-            copied_other_flag: 0,
-            copied_reserved: 0,
-            copied_raw_unaligned: 0,
+            reservation_allocatable_bytes: 0,
+            reservation_allocator_headroom_bytes: 0,
+            reservation_predicted_copy_bytes: 0,
+            copy_accounting: CopyAccounting::default(),
             entries_total: 0,
             entries_done: 0,
             non_directories_done: 0,
@@ -364,6 +341,9 @@ impl CopyFsState {
         dev: u64,
         reserve_start: u64,
         mapper: ExtentMapper,
+        reservation_allocatable_bytes: u64,
+        reservation_allocator_headroom_bytes: u64,
+        reservation_predicted_copy_bytes: u64,
     ) -> Self {
         Self {
             migrate_type:   MigrateType::Migrate,
@@ -382,17 +362,10 @@ impl CopyFsState {
             mapped_extents:   0,
             mapped_segments:  0,
             chunk_splits:     0,
-            copied_shared:    0,
-            copied_encoded:   0,
-            copied_encrypted: 0,
-            copied_not_aligned: 0,
-            copied_inline:    0,
-            copied_tail:      0,
-            copied_merged:    0,
-            copied_future_flags: 0,
-            copied_other_flag: 0,
-            copied_reserved: 0,
-            copied_raw_unaligned: 0,
+            reservation_allocatable_bytes,
+            reservation_allocator_headroom_bytes,
+            reservation_predicted_copy_bytes,
+            copy_accounting: CopyAccounting::default(),
             entries_total: 0,
             entries_done: 0,
             non_directories_done: 0,
@@ -424,28 +397,8 @@ fn check_cancellation_probe(probe: Option<fn() -> bool>) -> Result<(), BchError>
 
 impl CopyFsState {
     fn record_copy(&mut self, reason: CopyReason, bytes: u64) {
-        match reason {
-            CopyReason::Encoded => self.copied_encoded += bytes,
-            CopyReason::Encrypted => self.copied_encrypted += bytes,
-            CopyReason::Shared => self.copied_shared += bytes,
-            CopyReason::NotAligned => self.copied_not_aligned += bytes,
-            CopyReason::Inline => self.copied_inline += bytes,
-            CopyReason::Tail => {
-                self.copied_tail += bytes;
-                self.copied_other_flag += bytes;
-            }
-            CopyReason::Merged => {
-                self.copied_merged += bytes;
-                self.copied_other_flag += bytes;
-            }
-            CopyReason::FutureFlags => {
-                self.copied_future_flags += bytes;
-                self.copied_other_flag += bytes;
-            }
-            CopyReason::Reserved => self.copied_reserved += bytes,
-            CopyReason::RawUnaligned => self.copied_raw_unaligned += bytes,
-        }
-        self.total_wrote += bytes;
+        self.copy_accounting.record(reason, bytes);
+        self.total_wrote = self.copy_accounting.copied_bytes;
     }
 
     fn start_progress(&mut self, fs: &Fs, entries_total: u64) {
@@ -483,14 +436,20 @@ impl CopyFsState {
             || self.progress_last_emitted.elapsed() >= PROGRESS_INTERVAL
     }
 
-    fn emit_progress(&mut self, fs: &Fs, force: bool) {
+    fn emit_progress(&mut self, _fs: &Fs, force: bool) {
         if !force && !self.should_emit_progress() {
             return;
         }
 
-        let usage = fs.usage_read_short();
+        let reservation_remaining_bytes = self
+            .reservation_allocatable_bytes
+            .saturating_sub(self.total_wrote);
+        let reservation_required_remaining_bytes = self
+            .reservation_predicted_copy_bytes
+            .saturating_sub(self.total_wrote)
+            .saturating_add(self.reservation_allocator_headroom_bytes);
         eprintln!(
-            "MIGRATE_PROGRESS entries_done={} entries_total={} non_directories_done={} directories_done={} linked_bytes={} copied_bytes={} elapsed_seconds={} capacity_bytes={} used_bytes={} free_bytes={}",
+            "MIGRATE_PROGRESS entries_done={} entries_total={} non_directories_done={} directories_done={} linked_bytes={} copied_bytes={} elapsed_seconds={} reservation_allocatable_bytes={} reservation_copied_bytes={} reservation_predicted_copy_bytes={} reservation_allocator_headroom_bytes={} reservation_required_remaining_bytes={} reservation_remaining_bytes={}",
             self.entries_done,
             self.entries_total,
             self.non_directories_done,
@@ -498,9 +457,12 @@ impl CopyFsState {
             self.total_linked,
             self.total_wrote,
             self.progress_started.elapsed().as_secs(),
-            usage.capacity.saturating_mul(512),
-            usage.used.saturating_mul(512),
-            usage.free.saturating_mul(512),
+            self.reservation_allocatable_bytes,
+            self.total_wrote,
+            self.reservation_predicted_copy_bytes,
+            self.reservation_allocator_headroom_bytes,
+            reservation_required_remaining_bytes,
+            reservation_remaining_bytes,
         );
         self.progress_last_emitted = Instant::now();
         self.progress_last_entries = self.entries_done;
@@ -868,6 +830,7 @@ fn link_data(
 
 fn copy_link(
     fs: &Fs,
+    s: &mut CopyFsState,
     dst_inum: c::subvol_inum,
     dst: &mut c::bch_inode_unpacked,
     src: &CStr,
@@ -887,7 +850,9 @@ fn copy_link(
     buf[..target_bytes.len()].copy_from_slice(target_bytes);
     let padded = (link_len.div_ceil(block_size) * block_size) as usize;
 
-    write_data(fs, dst, 0, &buf[..padded])
+    write_data(fs, dst, 0, &buf[..padded])?;
+    s.record_copy(CopyReason::Symlink, link_len);
+    Ok(())
 }
 
 fn file_logical_for_segment(
@@ -977,41 +942,56 @@ fn link_file_data(
             .fe_logical
             .checked_add(visible_len)
             .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
-        if extent
-            .fe_flags
-            .contains(fiemap::FiemapExtentFlags::UNWRITTEN)
-        {
-            s.total_unwritten = s
-                .total_unwritten
-                .checked_add(visible_len)
-                .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
-            continue;
-        }
-
-        if let Some(reason) = extent_copy_reason(extent.fe_flags) {
-            copy_data(
-                fs,
-                s,
-                dst,
-                src_fd,
-                extent.fe_logical,
-                extent_end,
-                reason,
-            )?;
-            continue;
-        }
-
-        let segments = s
-            .mapper
-            .map_physical(extent.fe_physical, length)
-            .map_err(|error| {
+        match classify_extent(extent.fe_flags) {
+            ExtentDisposition::Hole => {
+                s.total_unwritten = s
+                    .total_unwritten
+                    .checked_add(visible_len)
+                    .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+                continue;
+            }
+            ExtentDisposition::Copy(reason) => {
+                copy_data(
+                    fs,
+                    s,
+                    dst,
+                    src_fd,
+                    extent.fe_logical,
+                    extent_end,
+                    reason,
+                )?;
+                continue;
+            }
+            ExtentDisposition::Unstable => {
                 eprintln!(
-                    "Unable to map FIEMAP logical extent in {}: {}",
+                    "Unstable FIEMAP extent remains in {}; quiesce the source and retry",
+                    src_path.to_string_lossy()
+                );
+                return Err(BchError::from_raw(-libc::EBUSY));
+            }
+            ExtentDisposition::Link => {}
+        }
+
+        let segments = match s.mapper.map_physical(extent.fe_physical, length) {
+            Ok(segments) => segments,
+            Err(error) => {
+                eprintln!(
+                    "Unable to map FIEMAP logical extent in {}; copying instead: {}",
                     src_path.to_string_lossy(),
                     error
                 );
-                BchError::from_raw(-libc::EINVAL)
-            })?;
+                copy_data(
+                    fs,
+                    s,
+                    dst,
+                    src_fd,
+                    extent.fe_logical,
+                    extent_end,
+                    CopyReason::RawMappingUnavailable,
+                )?;
+                continue;
+            }
+        };
         if segments.is_empty() {
             continue;
         }
@@ -1049,16 +1029,15 @@ fn link_file_data(
                 .checked_add(physical_offset)
                 .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
 
-            let reason = if link_physical < s.reserve_start {
-                Some(CopyReason::Reserved)
-            } else if (copy_start | link_physical | copy_len)
-                & (block_size - 1)
-                != 0
-            {
-                Some(CopyReason::RawUnaligned)
-            } else {
-                None
-            };
+            let reason = classify_segment(
+                copy_start,
+                link_physical,
+                copy_len,
+                MigrationCopyPolicy {
+                    block_bytes: block_size,
+                    reserved_superblock_end: s.reserve_start,
+                },
+            );
 
             if let Some(reason) = reason {
                 copy_data(fs, s, dst, src_fd, copy_start, copy_end, reason)?;
@@ -1089,38 +1068,6 @@ fn collect_fiemap(src_fd: BorrowedFd<'_>) -> Result<Vec<fiemap::FiemapExtent>, B
         .collect()
 }
 
-fn extent_copy_reason(flags: fiemap::FiemapExtentFlags) -> Option<CopyReason> {
-    let known = fiemap::FiemapExtentFlags::LAST
-        | fiemap::FiemapExtentFlags::UNKNOWN
-        | fiemap::FiemapExtentFlags::DELALLOC
-        | fiemap::FiemapExtentFlags::ENCODED
-        | fiemap::FiemapExtentFlags::DATA_ENCRYPTED
-        | fiemap::FiemapExtentFlags::NOT_ALIGNED
-        | fiemap::FiemapExtentFlags::DATA_INLINE
-        | fiemap::FiemapExtentFlags::DATA_TAIL
-        | fiemap::FiemapExtentFlags::UNWRITTEN
-        | fiemap::FiemapExtentFlags::MERGED
-        | fiemap::FiemapExtentFlags::SHARED;
-    if flags.contains(fiemap::FiemapExtentFlags::ENCODED) {
-        Some(CopyReason::Encoded)
-    } else if flags.contains(fiemap::FiemapExtentFlags::DATA_ENCRYPTED) {
-        Some(CopyReason::Encrypted)
-    } else if flags.contains(fiemap::FiemapExtentFlags::SHARED) {
-        Some(CopyReason::Shared)
-    } else if flags.contains(fiemap::FiemapExtentFlags::DATA_INLINE) {
-        Some(CopyReason::Inline)
-    } else if flags.contains(fiemap::FiemapExtentFlags::DATA_TAIL) {
-        Some(CopyReason::Tail)
-    } else if flags.contains(fiemap::FiemapExtentFlags::NOT_ALIGNED) {
-        Some(CopyReason::NotAligned)
-    } else if flags.contains(fiemap::FiemapExtentFlags::MERGED) {
-        Some(CopyReason::Merged)
-    } else if flags.bits() & !known.bits() != 0 {
-        Some(CopyReason::FutureFlags)
-    } else {
-        None
-    }
-}
 
 
 /// Add a range to the extents list.
@@ -1262,7 +1209,7 @@ fn copy_sync_file_range(
                 break;
             }
             write_data(fs, dst, start + m.start, &src_buf[m.start as usize..m.end as usize])?;
-            s.total_wrote += m.end - m.start;
+            s.record_copy(CopyReason::Other, m.end - m.start);
         }
 
         start += b as u64;
@@ -1593,7 +1540,7 @@ fn copy_dir(
             }
             DT_LNK => {
                 inode.bi_size = d.stat.st_size as u64;
-                copy_link(fs, dst_child_inum, &mut inode, name_cstr)?;
+                copy_link(fs, s, dst_child_inum, &mut inode, name_cstr)?;
             }
             _ => {
                 // DT_FIFO, DT_CHR, DT_BLK, DT_SOCK, DT_WHT — nothing else to copy
@@ -1711,27 +1658,78 @@ pub fn copy_fs(
         print_human_readable(s.total_linked);
         println!();
     }
+    if s.copy_accounting.reason_sum() != s.total_wrote {
+        eprintln!(
+            "MIGRATE_COPY_REASONS_INVALID copied_bytes={} reason_bytes={}",
+            s.total_wrote,
+            s.copy_accounting.reason_sum(),
+        );
+        return Err(BchError::from_raw(-libc::EIO));
+    }
     println!(
-        "MIGRATE_PLAN mode=migrate total_input_bytes={} linked_bytes={} copied_bytes={} copied_shared_bytes={} copied_encoded_bytes={} copied_encrypted_bytes={} copied_inline_bytes={} copied_not_aligned_bytes={} copied_other_flag_bytes={} unwritten_hole_bytes={} unstable_extent_bytes={} mapped_extent_count={} mapped_segment_count={} chunk_split_count={} copied_tail_bytes={} copied_merged_bytes={} copied_future_flags_bytes={} copied_reserved_bytes={} copied_raw_unaligned_bytes={}",
+        "MIGRATE_COPY_REASONS mode=migrate copied_bytes={} copied_shared_bytes={} copied_inline_bytes={} copied_encoded_bytes={} copied_encrypted_bytes={} copied_not_aligned_bytes={} copied_tail_bytes={} copied_merged_bytes={} copied_future_flags_bytes={} copied_reservation_overlap_bytes={} copied_raw_unaligned_bytes={} copied_raw_mapping_unavailable_bytes={} copied_unstable_bytes={} copied_symlink_bytes={} copied_other_bytes={}",
+        s.total_wrote,
+        s.copy_accounting.shared,
+        s.copy_accounting.inline,
+        s.copy_accounting.encoded,
+        s.copy_accounting.encrypted,
+        s.copy_accounting.not_aligned,
+        s.copy_accounting.tail,
+        s.copy_accounting.merged,
+        s.copy_accounting.future_flags,
+        s.copy_accounting.reservation_overlap,
+        s.copy_accounting.raw_unaligned,
+        s.copy_accounting.raw_mapping_unavailable,
+        s.copy_accounting.unstable,
+        s.copy_accounting.symlink,
+        s.copy_accounting.other,
+    );
+    if std::env::var_os("BCACHEFS_TEST_COPY_DIAGNOSTICS").is_some() {
+        let mut reasons = s.copy_accounting.reason_counts();
+        reasons.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| left.0.name().cmp(right.0.name()))
+        });
+        for (rank, (reason, bytes)) in reasons
+            .into_iter()
+            .filter(|(_, bytes)| *bytes != 0)
+            .take(8)
+            .enumerate()
+        {
+            println!(
+                "MIGRATE_COPY_TOP mode=migrate rank={} reason={} copied_bytes={}",
+                rank + 1,
+                reason.name(),
+                bytes,
+            );
+        }
+    }
+    println!(
+        "MIGRATE_PLAN mode=migrate total_input_bytes={} linked_bytes={} copied_bytes={} copied_shared_bytes={} copied_inline_bytes={} copied_encoded_bytes={} copied_encrypted_bytes={} copied_not_aligned_bytes={} copied_tail_bytes={} copied_merged_bytes={} copied_future_flags_bytes={} copied_reservation_overlap_bytes={} copied_raw_unaligned_bytes={} copied_raw_mapping_unavailable_bytes={} copied_unstable_bytes={} copied_symlink_bytes={} copied_other_bytes={} unwritten_hole_bytes={} unstable_extent_bytes={} mapped_extent_count={} mapped_segment_count={} chunk_split_count={}",
         s.total_input,
         s.total_linked,
         s.total_wrote,
-        s.copied_shared,
-        s.copied_encoded,
-        s.copied_encrypted,
-        s.copied_inline,
-        s.copied_not_aligned,
-        s.copied_other_flag,
+        s.copy_accounting.shared,
+        s.copy_accounting.inline,
+        s.copy_accounting.encoded,
+        s.copy_accounting.encrypted,
+        s.copy_accounting.not_aligned,
+        s.copy_accounting.tail,
+        s.copy_accounting.merged,
+        s.copy_accounting.future_flags,
+        s.copy_accounting.reservation_overlap,
+        s.copy_accounting.raw_unaligned,
+        s.copy_accounting.raw_mapping_unavailable,
+        s.copy_accounting.unstable,
+        s.copy_accounting.symlink,
+        s.copy_accounting.other,
         s.total_unwritten,
         s.total_unstable,
         s.mapped_extents,
         s.mapped_segments,
         s.chunk_splits,
-        s.copied_tail,
-        s.copied_merged,
-        s.copied_future_flags,
-        s.copied_reserved,
-        s.copied_raw_unaligned,
     );
     println!("MIGRATE_RESULT eligible=yes");
 
@@ -1757,7 +1755,7 @@ mod tests {
 
     #[test]
     fn emits_progress_after_interval_without_completed_entries() {
-        let mut state = CopyFsState::new_migrate(1, 1, 0, ExtentMapper::Identity);
+        let mut state = CopyFsState::new_migrate(1, 1, 0, ExtentMapper::Identity, 0, 0, 0);
         state.progress_last_emitted = Instant::now() - PROGRESS_INTERVAL;
 
         assert!(state.should_emit_progress());

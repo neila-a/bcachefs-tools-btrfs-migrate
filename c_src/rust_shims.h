@@ -214,6 +214,9 @@ struct rust_journal_entries rust_collect_journal_entries(struct bch_fs *c);
  */
 void rust_set_bit(unsigned long nr, unsigned long *addr);
 
+/* Count bucket bits excluded by buckets_nouse. */
+unsigned long rust_count_set_bits(const unsigned long *addr, unsigned long nbits);
+
 /*
  * Data IO shims — wraps static inlines not available through bindgen.
  * Data must be block-aligned and <= 1MB.

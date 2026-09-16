@@ -117,6 +117,16 @@ void rust_set_bit(unsigned long nr, unsigned long *addr)
 	set_bit(nr, addr);
 }
 
+unsigned long rust_count_set_bits(const unsigned long *addr, unsigned long nbits)
+{
+	unsigned long count = 0;
+
+	for (unsigned long bit = 0; bit < nbits; bit++)
+		if (test_bit(bit, addr))
+			count++;
+	return count;
+}
+
 /*
  * Data IO shims — bridge Rust async IO to kernel closure-based completion.
  *

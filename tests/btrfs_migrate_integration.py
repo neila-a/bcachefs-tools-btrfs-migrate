@@ -49,6 +49,13 @@ RESERVATION_FIELDS = (
     "reservation_default_superblock_protected_bytes",
     "reservation_device_tail_bytes",
 )
+
+RESERVATION_NOUSE_FIELDS = (
+    "reservation_total_bucket_count",
+    "reservation_nouse_excluded_bucket_count",
+    "reservation_allocatable_bucket_count",
+    "reservation_allocatable_bytes",
+)
 ALTERNATE_SUPERBLOCK_RE = re.compile(r"mount -t bcachefs -o ro,sb=(\d+)")
 
 
@@ -72,6 +79,7 @@ def _require_host_prerequisites() -> None:
         "mkfs.btrfs",
         "btrfs",
         "blockdev",
+        "cp",
         "losetup",
         "mount",
         "umount",
@@ -124,6 +132,13 @@ def _reservation_metrics(output: str) -> dict[str, int]:
     assert not missing, f"missing reservation metrics {missing}:\n{output}"
     return metrics
 
+
+def _reservation_nouse_metrics(output: str) -> dict[str, int]:
+    match = re.search(r"(?m)^MIGRATE_RESERVATION_NOUSE (?P<fields>.+)$", output)
+    assert match, f"missing reservation nouse metrics:\n{output}"
+    fields = dict(field.split("=", 1) for field in match["fields"].split())
+    return {name: int(fields[name]) for name in RESERVATION_NOUSE_FIELDS}
+
 def _allocator_scan_metrics(output: str) -> dict[str, int]:
     match = re.search(
         r"(?m)^MIGRATE_ALLOCATOR_SCAN max_paths=(\d+) "
@@ -147,10 +162,77 @@ PROGRESS_FIELDS = (
     "linked_bytes",
     "copied_bytes",
     "elapsed_seconds",
-    "capacity_bytes",
-    "used_bytes",
-    "free_bytes",
+    "reservation_allocatable_bytes",
+    "reservation_copied_bytes",
+    "reservation_predicted_copy_bytes",
+    "reservation_allocator_headroom_bytes",
+    "reservation_required_remaining_bytes",
+    "reservation_remaining_bytes",
 )
+
+COPY_REASON_FIELDS = (
+    "copied_shared_bytes",
+    "copied_inline_bytes",
+    "copied_encoded_bytes",
+    "copied_encrypted_bytes",
+    "copied_not_aligned_bytes",
+    "copied_tail_bytes",
+    "copied_merged_bytes",
+    "copied_future_flags_bytes",
+    "copied_reservation_overlap_bytes",
+    "copied_raw_unaligned_bytes",
+    "copied_raw_mapping_unavailable_bytes",
+    "copied_unstable_bytes",
+    "copied_symlink_bytes",
+    "copied_other_bytes",
+)
+
+
+def _copy_reasons(output: str, mode: str) -> dict[str, int]:
+    match = re.search(
+        rf"(?m)^MIGRATE_COPY_REASONS mode={re.escape(mode)} (?P<fields>.+)$",
+        output,
+    )
+    assert match, f"missing {mode} copy reason accounting:\n{output}"
+    fields = dict(field.split("=", 1) for field in match["fields"].split())
+    parsed = {name: int(fields[name]) for name in COPY_REASON_FIELDS}
+    assert int(fields["copied_bytes"]) == sum(parsed.values()), output
+    return parsed
+
+
+def _copy_policy(output: str, mode: str) -> dict[str, int]:
+    match = re.search(
+        rf"(?m)^MIGRATE_COPY_POLICY mode={re.escape(mode)} (?P<fields>.+)$",
+        output,
+    )
+    assert match, f"missing {mode} copy policy:\n{output}"
+    fields = dict(field.split("=", 1) for field in match["fields"].split())
+    return {
+        "candidate_block_bytes": int(fields["candidate_block_bytes"]),
+        "reserved_superblock_end": int(fields["reserved_superblock_end"]),
+    }
+
+PLAN_FIELDS = (
+    "linked_bytes",
+    "copied_bytes",
+    "unwritten_hole_bytes",
+    "unstable_extent_bytes",
+    "mapped_extent_count",
+    "mapped_segment_count",
+    "chunk_split_count",
+)
+
+
+def _migration_plan(output: str, mode: str) -> dict[str, int]:
+    match = re.search(
+        rf"(?m)^MIGRATE_PLAN mode={re.escape(mode)} (?P<fields>.+)$",
+        output,
+    )
+    assert match, f"missing {mode} migration plan:\n{output}"
+    fields = dict(field.split("=", 1) for field in match["fields"].split())
+    return {name: int(fields[name]) for name in PLAN_FIELDS}
+
+
 
 
 def _migration_progress(output: str) -> list[dict[str, int]]:
@@ -180,8 +262,13 @@ def _migration_progress(output: str) -> list[dict[str, int]]:
         for previous, current in zip(parsed, parsed[1:])
     ), output
     assert all(
-        0 <= record["used_bytes"] <= record["capacity_bytes"]
-        and record["used_bytes"] + record["free_bytes"] == record["capacity_bytes"]
+        record["reservation_allocatable_bytes"] > 0
+        and record["reservation_copied_bytes"] == record["copied_bytes"]
+        and record["reservation_remaining_bytes"]
+        == record["reservation_allocatable_bytes"] - record["copied_bytes"]
+        and record["reservation_predicted_copy_bytes"]
+        + record["reservation_allocator_headroom_bytes"]
+        <= record["reservation_allocatable_bytes"]
         for record in parsed
     ), output
     return parsed
@@ -502,6 +589,75 @@ def _write_non_directory_entries(image: BtrfsImage) -> None:
     os.symlink("dir-0000/file-0000", image.mountpoint / "tree-link")
     os.mkfifo(image.mountpoint / "named-pipe")
 
+
+COPY_PRESSURE_FILE_BYTES = 672 * 1024 * 1024
+
+
+def _write_copy_pressure_fixture(image: BtrfsImage) -> None:
+    image.assert_writable_top_level()
+    source = image.mountpoint / "shared-source"
+    chunk = b"\0" * (4 * 1024 * 1024)
+    with source.open("wb") as file:
+        for _ in range(COPY_PRESSURE_FILE_BYTES // len(chunk)):
+            file.write(chunk)
+        file.flush()
+        os.fsync(file.fileno())
+    _run(["cp", "--reflink=always", source, image.mountpoint / "shared-clone"])
+    image.sync()
+
+
+def _write_reflink_fragmented_fixture(image: BtrfsImage) -> None:
+    image.assert_writable_top_level()
+    block = bytes(range(256)) * (4096 // 256)
+
+    (image.mountpoint / "inline-tail").write_bytes(b"tail")
+    sparse = image.mountpoint / "sparse"
+    with sparse.open("wb") as file:
+        file.write(block)
+        file.seek(4 * 1024 * 1024)
+        file.write(block)
+        file.flush()
+        os.fsync(file.fileno())
+    with (image.mountpoint / "unwritten").open("wb") as file:
+        os.posix_fallocate(file.fileno(), 0, 4 * 1024 * 1024)
+        file.flush()
+        os.fsync(file.fileno())
+
+    shared = image.mountpoint / "shared"
+    with shared.open("wb") as file:
+        for _ in range(256):
+            file.write(block)
+        file.flush()
+        os.fsync(file.fileno())
+    _run(["cp", "--reflink=always", shared, image.mountpoint / "shared-clone"])
+
+    hardlinked = image.mountpoint / "hardlinked"
+    hardlinked.write_bytes(block * 2)
+    os.link(hardlinked, image.mountpoint / "hardlinked-alias")
+
+    fragments = []
+    for index in range(24):
+        fragment = image.mountpoint / f"fragment-reserve-{index:02d}"
+        fragment.write_bytes(block * 64)
+        fragments.append(fragment)
+    for fragment in fragments[::2]:
+        fragment.unlink()
+
+    with (image.mountpoint / "fragmented").open("wb") as file:
+        for _ in range(128):
+            file.write(block)
+        file.flush()
+        os.fsync(file.fileno())
+    for fragment in fragments[1::2]:
+        fragment.unlink()
+
+    chunk = block * 1024
+    with (image.mountpoint / "chunk-boundary").open("wb") as file:
+        for _ in range(300):
+            file.write(chunk)
+        file.flush()
+        os.fsync(file.fileno())
+    image.sync()
 def _fragment_available_space(image: BtrfsImage) -> None:
     image.assert_writable_top_level()
     fragments = []
@@ -674,6 +830,7 @@ def test_a_supported_btrfs_no_change_is_eligible(btrfs_image: BtrfsImage) -> Non
 
     assert result.returncode == 0, result.stdout
     assert "MIGRATE_RESULT eligible=yes" in result.stdout, result.stdout
+    _copy_reasons(result.stdout, "no-change")
     assert not (btrfs_image.mountpoint / "bcachefs").exists()
     assert _sha256(btrfs_image.image) == image_before
 
@@ -692,6 +849,11 @@ def test_b_supported_btrfs_migrates_with_full_reservation_metrics(
     _assert_bounded_allocator_result(result)
     metrics = _reservation_metrics(result.stdout)
     assert metrics["reservation_usable_full_bucket_bytes"] > 0
+    nouse = _reservation_nouse_metrics(result.stdout)
+    assert (
+        nouse["reservation_allocatable_bytes"]
+        == metrics["reservation_usable_full_bucket_bytes"]
+    )
     progress = _migration_progress(result.stdout)
     assert len(progress) == 2, result.stdout
     assert progress[0]["entries_done"] == 0
@@ -702,6 +864,7 @@ def test_b_supported_btrfs_migrates_with_full_reservation_metrics(
         progress[-1]["non_directories_done"] + progress[-1]["directories_done"]
         == progress[-1]["entries_total"]
     )
+    _copy_reasons(result.stdout, "migrate")
     assert (btrfs_image.mountpoint / "bcachefs").is_file()
     candidate = btrfs_image.mount_bcachefs_candidate_readonly(
         _alternate_superblock(result.stdout)
@@ -857,6 +1020,110 @@ def test_allocator_scan_restart_unwinds_and_retries(
     assert scan_metrics["max_paths"] <= 16, result.stdout
 
 
+
+def test_copy_capacity_preflight_rejects_before_candidate_writes(
+    btrfs_image: BtrfsImage,
+) -> None:
+    _write_copy_pressure_fixture(btrfs_image)
+    manifest = _manifest(btrfs_image.mountpoint)
+
+    no_change = _migrate(btrfs_image, "--no-change", "-f")
+    assert no_change.returncode == 0, no_change.stdout
+    no_change_reasons = _copy_reasons(no_change.stdout, "no-change")
+    assert no_change_reasons["copied_shared_bytes"] >= 2 * COPY_PRESSURE_FILE_BYTES
+
+    result = _migrate(btrfs_image, "-f")
+
+    assert result.returncode != 0, result.stdout
+    assert "MIGRATE_COPY_FEASIBILITY verdict=reject" in result.stdout, result.stdout
+    assert "initializing new filesystem" not in result.stdout, result.stdout
+    assert "Migrate complete" not in result.stdout, result.stdout
+    reservation_before = _reservation_state(btrfs_image)
+    _assert_manifest(btrfs_image.mountpoint, manifest)
+
+    legacy = _start_migrate(
+        btrfs_image,
+        "-F",
+        "-f",
+        env={
+            **os.environ,
+            "BCACHEFS_TEST_BYPASS_COPY_FEASIBILITY": "1",
+        },
+    )
+    legacy_output = _wait_for_migrate_exit(legacy, MIGRATE_TIMEOUT_SECONDS)
+    assert legacy.returncode != 0, legacy_output
+    assert "no_buckets_found" in legacy_output, legacy_output
+    assert _reservation_state(btrfs_image) == reservation_before
+    _assert_manifest(btrfs_image.mountpoint, manifest)
+
+def test_retry_no_change_classifier_matches_runtime_with_existing_reservation(
+    btrfs_image: BtrfsImage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_reflink_fragmented_fixture(btrfs_image)
+    _write_tree(btrfs_image, directories=2, files_per_directory=4)
+    _write_non_directory_entries(btrfs_image)
+    btrfs_image.sync()
+    monkeypatch.setenv("BCACHEFS_TEST_COPY_DIAGNOSTICS", "1")
+    manifest = _manifest(btrfs_image.mountpoint)
+
+    initial_plan = _migrate(btrfs_image, "--no-change", "-f")
+    assert initial_plan.returncode == 0, initial_plan.stdout
+    initial_reasons = _copy_reasons(initial_plan.stdout, "no-change")
+    initial_stats = _migration_plan(initial_plan.stdout, "no-change")
+    assert initial_reasons["copied_shared_bytes"] > 0
+    assert initial_reasons["copied_inline_bytes"] > 0
+    assert initial_reasons["copied_symlink_bytes"] > 0
+    assert initial_stats["mapped_extent_count"] > 1
+    assert int(re.search(r"data_chunk_count=(\d+)", initial_plan.stdout).group(1)) > 1
+
+    process = _start_migrate(
+        btrfs_image,
+        "-f",
+        env={
+            **os.environ,
+            "BCACHEFS_TEST_INTERRUPT_AFTER_DIRTY": "1",
+        },
+    )
+    reservation_before = _wait_for_reservation(btrfs_image, process)
+    interrupted = _wait_for_migrate_output(process, "MIGRATE_INTERRUPT_READY", timeout=30)
+    os.killpg(process.pid, signal.SIGINT)
+    interrupted += _wait_for_migrate_exit(process, GOING_RO_ABORT_TIMEOUT_SECONDS)
+    assert process.returncode != 0, interrupted
+    assert _reservation_state(btrfs_image) == reservation_before
+    _assert_manifest(btrfs_image.mountpoint, manifest)
+
+    retry_plan = _migrate(btrfs_image, "--no-change", "-F", "-f")
+    assert retry_plan.returncode == 0, retry_plan.stdout
+    retry_reasons = _copy_reasons(retry_plan.stdout, "no-change")
+    retry_stats = _migration_plan(retry_plan.stdout, "no-change")
+    assert retry_reasons == initial_reasons
+    assert retry_stats == initial_stats
+
+    retried = _migrate(btrfs_image, "-F", "-f")
+    assert retried.returncode == 0, retried.stdout
+    assert _copy_reasons(retried.stdout, "preflight") == retry_reasons
+    assert _copy_reasons(retried.stdout, "migrate") == retry_reasons
+    assert _migration_plan(retried.stdout, "migrate") == retry_stats
+    assert _copy_policy(retry_plan.stdout, "no-change") == _copy_policy(
+        retried.stdout, "migrate"
+    )
+    top_reasons = re.findall(
+        r"(?m)^MIGRATE_COPY_TOP mode=migrate rank=(\d+) reason=(\w+) copied_bytes=(\d+)$",
+        retried.stdout,
+    )
+    assert top_reasons, retried.stdout
+    assert top_reasons[0][1] == "shared"
+    assert _reservation_state(btrfs_image).inode == reservation_before.inode
+    _assert_manifest(btrfs_image.mountpoint, manifest)
+
+    candidate = btrfs_image.mount_bcachefs_candidate_readonly(
+        _alternate_superblock(retried.stdout)
+    )
+    try:
+        _assert_manifest(candidate, manifest)
+    finally:
+        btrfs_image.unmount_bcachefs_candidate()
 def test_retry_existing_migration_reservation_is_bounded_and_valid(
     btrfs_image: BtrfsImage,
 ) -> None:
