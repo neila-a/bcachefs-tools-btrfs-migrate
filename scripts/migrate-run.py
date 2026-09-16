@@ -293,6 +293,14 @@ def command_output(command: list[str]) -> str:
     ).stdout.strip()
 
 
+def bcachefs_version(binary: Path) -> str:
+    output = command_output([os.fspath(binary), "version"])
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        raise RuntimeError("bcachefs version produced no version line")
+    return lines[-1]
+
+
 def elf_build_id(binary: Path) -> str:
     readelf = shutil.which("readelf")
     if readelf is None:
@@ -354,7 +362,7 @@ def create_run_snapshot(source: Path, run_dir: Path) -> tuple[Path, dict[str, ob
             "source": os.fspath(source),
             "snapshot": os.fspath(snapshot),
             "sha256": sha256_file(snapshot),
-            "version": command_output([os.fspath(snapshot), "--version"]),
+            "version": bcachefs_version(snapshot),
             "build_id": elf_build_id(snapshot),
         },
     }
@@ -408,9 +416,9 @@ def main(args: argparse.Namespace) -> int:
             "--",
             os.fspath(snapshot),
             "migrate",
+            *args.migration_args,
             "-f",
             os.fspath(args.source),
-            *args.migration_args,
         ],
         check=False,
     ).returncode
