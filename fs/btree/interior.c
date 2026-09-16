@@ -14,6 +14,7 @@
 #include "btree/update.h"
 #include "btree/interior.h"
 #include "btree/iter.h"
+#include "btree/key_cache.h"
 #include "btree/journal_overlay.h"
 #include "btree/locking.h"
 #include "btree/read.h"
@@ -681,9 +682,11 @@ static int bch2_btree_reserve_get(struct btree_trans *trans,
 	 * Protects reaping from the btree node cache and using the btree node
 	 * open bucket reserve:
 	 */
-	try(bch2_btree_cache_cannibalize_lock(trans, req->cl));
-
-	int ret = 0;
+	int ret = bch2_btree_cache_cannibalize_lock(trans, req->cl);
+	if (ret) {
+		bch2_test_key_cache_going_ro_abort_reserve_get_result(trans->c, req, ret);
+		return ret;
+	}
 	for (unsigned interior = 0; interior < 2; interior++) {
 		struct prealloc_nodes *p = as->prealloc_nodes + interior;
 
@@ -698,6 +701,9 @@ static int bch2_btree_reserve_get(struct btree_trans *trans,
 		}
 	}
 err:
+	if (ret)
+		bch2_test_key_cache_going_ro_abort_reserve_get_result(trans->c, req, ret);
+
 	bch2_btree_cache_cannibalize_unlock(trans);
 	return ret;
 }
@@ -1110,9 +1116,10 @@ static void btree_update_nodes_written(struct btree_update *as)
 
 					if (do_pin) {
 						BUG_ON(!b->c.level);
-						BUG_ON(!btree_node_dirty(b));
 
 						if (!ret) {
+							BUG_ON(!btree_node_dirty(b));
+
 							struct bset *last = btree_bset_last(b);
 
 							last->journal_seq = cpu_to_le64(
@@ -1122,10 +1129,10 @@ static void btree_update_nodes_written(struct btree_update *as)
 							bch2_btree_add_journal_pin(c, b, journal_seq);
 						} else {
 							/*
-							 * If we didn't get a journal sequence
-							 * number we can't write this btree node,
-							 * because recovery won't know to ignore
-							 * this write:
+							 * Emergency teardown may already have
+							 * force-cleared the dirty bit. Either way,
+							 * without a journal sequence this node
+							 * must never be written.
 							 */
 							set_btree_node_never_write(b);
 						}
@@ -1571,6 +1578,15 @@ bch2_btree_update_start(struct btree_trans *trans, btree_path_idx_t path_idx,
 		goto err;
 
 	ret = bch2_btree_reserve_get(trans, as, nr_nodes, req);
+
+	/*
+	 * Going-RO has already stopped the allocator paths that could make
+	 * metadata space available. A completed full scan with no usable buckets
+	 * cannot improve by waiting on the allocator.
+	 */
+	if (test_bit(BCH_FS_going_ro, &c->flags) &&
+	    bch2_err_matches(ret, BCH_ERR_no_buckets_found))
+		goto err;
 	if (bch2_err_matches(ret, EAGAIN) ||
 	    bch2_err_matches(ret, ENOMEM)) {
 		/*
@@ -2310,12 +2326,13 @@ int bch2_btree_split_leaf(struct btree_trans *trans,
 			  unsigned new_key_u64s,
 			  enum bch_trans_commit_flags flags)
 {
+	bch2_test_key_cache_going_ro_abort_split_attempted();
+
 	/* btree_split & merge may both cause paths array to be reallocated */
 	struct btree *b = path_l(trans->paths + path)->b;
 	struct btree_update *as;
 	unsigned l;
 	int ret = 0;
-
 
 	as = bch2_btree_update_start(trans, path,
 				     trans->paths[path].level,

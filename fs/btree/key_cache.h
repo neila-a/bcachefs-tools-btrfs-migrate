@@ -4,6 +4,50 @@
 
 #include "btree/bkey.h"
 
+
+struct alloc_request;
+
+#ifndef __KERNEL__
+bool bch2_test_key_cache_going_ro_abort_enabled(void);
+bool bch2_test_key_cache_going_ro_abort_active(void);
+int bch2_test_key_cache_going_ro_abort_dirty(struct bch_fs *, u64);
+void bch2_test_key_cache_going_ro_abort_ready(struct bch_fs *);
+void bch2_test_key_cache_going_ro_abort_split_attempted(void);
+void bch2_test_key_cache_going_ro_abort_reserve_get_result(struct bch_fs *,
+							    const struct alloc_request *, int);
+#else
+static inline bool bch2_test_key_cache_going_ro_abort_enabled(void)
+{
+	return false;
+}
+
+static inline bool bch2_test_key_cache_going_ro_abort_active(void)
+{
+	return false;
+}
+
+static inline void bch2_test_key_cache_going_ro_abort_ready(struct bch_fs *c)
+{
+}
+
+
+
+static inline int
+bch2_test_key_cache_going_ro_abort_dirty(struct bch_fs *c, u64 nr)
+{
+	return 0;
+}
+static inline void bch2_test_key_cache_going_ro_abort_split_attempted(void)
+{
+}
+
+static inline void
+bch2_test_key_cache_going_ro_abort_reserve_get_result(struct bch_fs *c,
+						       const struct alloc_request *req,
+						       int ret)
+{
+}
+#endif
 static inline size_t bch2_nr_btree_keys_need_flush(struct bch_fs *c)
 {
 	size_t nr_dirty = atomic_long_read(&c->btree.key_cache.nr_dirty);

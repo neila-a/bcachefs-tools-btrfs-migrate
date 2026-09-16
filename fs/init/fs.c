@@ -79,6 +79,10 @@
 #include "util/enumerated_ref.h"
 #include "util/thread_with_file.h"
 
+#ifndef __KERNEL__
+#include <stdio.h>
+#endif
+
 #include <linux/backing-dev.h>
 #include <linux/blkdev.h>
 #include <linux/debugfs.h>
@@ -353,19 +357,52 @@ static void __bch2_fs_read_only(struct bch_fs *c)
 
 	do {
 		clean_passes++;
+#ifndef __KERNEL__
+		if (bch2_test_key_cache_going_ro_abort_enabled())
+			fprintf(stderr, "MIGRATE_ABORT_RO_STAGE clean_pass=%u\n", clean_passes);
+#endif
+
+		/*
+		 * A failed metadata commit may transition the journal to error while
+		 * the preceding clean pass was still running. Further clean passes
+		 * cannot make progress: interior-update completion can wait on writes
+		 * that the dead journal has made impossible. Fall through to the
+		 * existing emergency teardown, which cancels those writes before
+		 * draining their updates.
+		 */
+		if (bch2_journal_error(&c->journal))
+			break;
 
 		bch2_do_discards_going_ro(c);
 
-		if (bch2_btree_write_buffer_flush_going_ro(c) ||
-		    bch2_btree_key_cache_flush_going_ro(c) ||
-		    bch2_btree_interior_updates_flush(c) ||
-		    bch2_journal_flush_all_pins(&c->journal) ||
-		    bch2_btree_flush_all_writes(c) ||
-		    seq != atomic64_read(&c->journal.seq)) {
+		int key_cache_ret = 0;
+		bool did_work =
+			bch2_btree_write_buffer_flush_going_ro(c) ||
+			(key_cache_ret = bch2_btree_key_cache_flush_going_ro(c)) ||
+			bch2_btree_interior_updates_flush(c) ||
+			bch2_journal_flush_all_pins(&c->journal) ||
+			bch2_btree_flush_all_writes(c);
+
+		if (did_work || seq != atomic64_read(&c->journal.seq)) {
 			seq = atomic64_read(&c->journal.seq);
 			clean_passes = 0;
 		}
+
+		if (key_cache_ret &&
+		    bch2_err_matches(key_cache_ret, BCH_ERR_no_buckets_found)) {
+			bch2_fs_fatal_error(c,
+				"flushing key cache while going read-only: %s",
+				bch2_err_str(key_cache_ret));
+			break;
+		}
+
+		if (bch2_journal_error(&c->journal))
+			break;
 	} while (clean_passes < 2);
+#ifndef __KERNEL__
+	if (bch2_test_key_cache_going_ro_abort_enabled())
+		fprintf(stderr, "MIGRATE_ABORT_RO_STAGE clean_loop_complete\n");
+#endif
 
 	/*
 	 * On a dead journal the clean-shutdown loop above can't make dirty
@@ -447,6 +484,10 @@ void bch2_fs_read_only(struct bch_fs *c)
 	bch2_reconcile_stop(c);
 
 	enumerated_ref_stop_async(&c->writes);
+#ifndef __KERNEL__
+	if (bch2_test_key_cache_going_ro_abort_enabled())
+		fprintf(stderr, "MIGRATE_ABORT_RO_STAGE writes_disable_wait_begin\n");
+#endif
 
 	/*
 	 * If we're not doing an emergency shutdown, we want to wait on
@@ -462,15 +503,27 @@ void bch2_fs_read_only(struct bch_fs *c)
 	wait_event(bch2_read_only_wait,
 		   test_bit(BCH_FS_write_disable_complete, &c->flags) ||
 		   test_bit(BCH_FS_emergency_ro, &c->flags));
+#ifndef __KERNEL__
+	if (bch2_test_key_cache_going_ro_abort_enabled())
+		fprintf(stderr, "MIGRATE_ABORT_RO_STAGE writes_disable_wait_complete\n");
+#endif
 
 	bool writes_disabled = test_bit(BCH_FS_write_disable_complete, &c->flags);
 	if (writes_disabled)
 		bch_verbose(c, "finished waiting for writes to stop");
 
 	__bch2_fs_read_only(c);
+#ifndef __KERNEL__
+	if (bch2_test_key_cache_going_ro_abort_enabled())
+		fprintf(stderr, "MIGRATE_ABORT_RO_STAGE clean_loop_returned\n");
+#endif
 
 	wait_event(bch2_read_only_wait,
 		   test_bit(BCH_FS_write_disable_complete, &c->flags));
+#ifndef __KERNEL__
+	if (bch2_test_key_cache_going_ro_abort_enabled())
+		fprintf(stderr, "MIGRATE_ABORT_RO_STAGE writes_disabled_finally\n");
+#endif
 
 	if (!writes_disabled)
 		bch_verbose(c, "finished waiting for writes to stop");

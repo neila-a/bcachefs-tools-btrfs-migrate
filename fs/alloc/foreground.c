@@ -688,6 +688,8 @@ static struct open_bucket *bch2_bucket_alloc_freelist(struct btree_trans *trans,
 		start = ca->mi.first_bucket;
 	}
 
+	req->counters.complete_device_scans++;
+
 	return NULL;
 }
 
