@@ -38,8 +38,8 @@ use crate::btrfs_migrate::{
 };
 use crate::wrappers::super_io;
 use crate::migration_copy_policy::{
-    classify_extent, classify_segment, CopyAccounting, CopyReason, ExtentDisposition,
-    MigrationCopyPolicy,
+    classify_extent, copy_write_bytes, plan_raw_segment, CopyAccounting, CopyReason,
+    ExtentDisposition, MigrationCopyPolicy, RawSegmentDisposition,
 };
 
 // ---- C shim declarations ----
@@ -392,6 +392,7 @@ const MIGRATION_ALLOCATOR_HEADROOM_FRACTION: u64 = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CopyFeasibility {
     allocator_headroom_bytes: u64,
+    usable_capacity_bytes: u64,
     required_bytes: u64,
     fits: bool,
 }
@@ -401,11 +402,15 @@ fn copy_feasibility(capacity: &ReservationCapacity, predicted_copy_bytes: u64) -
         / MIGRATION_ALLOCATOR_HEADROOM_FRACTION)
         .max(MIN_MIGRATION_ALLOCATOR_HEADROOM_BYTES)
         .min(capacity.usable_full_bucket_bytes);
+    let usable_capacity_bytes = capacity
+        .usable_full_bucket_bytes
+        .saturating_sub(allocator_headroom_bytes);
     let required_bytes = predicted_copy_bytes.saturating_add(allocator_headroom_bytes);
     CopyFeasibility {
         allocator_headroom_bytes,
+        usable_capacity_bytes,
         required_bytes,
-        fits: required_bytes <= capacity.usable_full_bucket_bytes,
+        fits: predicted_copy_bytes < usable_capacity_bytes,
     }
 }
 
@@ -418,9 +423,10 @@ fn print_copy_reasons(mode: &str, copied: &CopyAccounting) -> Result<()> {
         );
     }
     println!(
-        "MIGRATE_COPY_REASONS mode={} copied_bytes={} copied_shared_bytes={} copied_inline_bytes={} copied_encoded_bytes={} copied_encrypted_bytes={} copied_not_aligned_bytes={} copied_tail_bytes={} copied_merged_bytes={} copied_future_flags_bytes={} copied_reservation_overlap_bytes={} copied_raw_unaligned_bytes={} copied_raw_mapping_unavailable_bytes={} copied_unstable_bytes={} copied_symlink_bytes={} copied_other_bytes={}",
+        "MIGRATE_COPY_REASONS mode={} copied_bytes={} copy_allocated_bytes={} copied_shared_bytes={} copied_inline_bytes={} copied_encoded_bytes={} copied_encrypted_bytes={} copied_not_aligned_bytes={} copied_tail_bytes={} copied_merged_bytes={} copied_future_flags_bytes={} copied_reservation_overlap_bytes={} copied_raw_unaligned_bytes={} copied_raw_unaligned_head_bytes={} copied_raw_unaligned_tail_bytes={} copied_raw_unaligned_unsalvageable_bytes={} copied_raw_mapping_unavailable_bytes={} copied_unstable_bytes={} copied_symlink_bytes={} copied_other_bytes={}",
         mode,
         copied.copied_bytes,
+        copied.allocated_copy_bytes,
         copied.shared,
         copied.inline,
         copied.encoded,
@@ -430,7 +436,10 @@ fn print_copy_reasons(mode: &str, copied: &CopyAccounting) -> Result<()> {
         copied.merged,
         copied.future_flags,
         copied.reservation_overlap,
-        copied.raw_unaligned,
+        copied.raw_unaligned_bytes(),
+        copied.raw_unaligned_head,
+        copied.raw_unaligned_tail,
+        copied.raw_unaligned_unsalvageable,
         copied.raw_mapping_unavailable,
         copied.unstable,
         copied.symlink,
@@ -445,19 +454,19 @@ fn ensure_copy_feasibility(
 ) -> Result<CopyFeasibility> {
     let feasibility = copy_feasibility(capacity, predicted_copy_bytes);
     println!(
-        "MIGRATE_COPY_FEASIBILITY verdict={} predicted_copy_bytes={} reservation_usable_full_bucket_bytes={} allocator_headroom_bytes={} required_bytes={}",
+        "MIGRATE_COPY_FEASIBILITY verdict={} predicted_copy_bytes={} reservation_usable_full_bucket_bytes={} allocator_headroom_bytes={} usable_capacity_bytes={} required_bytes={}",
         if feasibility.fits { "fit" } else { "reject" },
         predicted_copy_bytes,
         capacity.usable_full_bucket_bytes,
         feasibility.allocator_headroom_bytes,
+        feasibility.usable_capacity_bytes,
         feasibility.required_bytes,
     );
-    if !feasibility.fits && std::env::var_os("BCACHEFS_TEST_BYPASS_COPY_FEASIBILITY").is_none() {
+    if !feasibility.fits {
         bail!(
-            "migration copy preflight requires {} bytes ({} copied + {} allocator headroom), but the reservation exposes only {} allocatable bytes",
-            feasibility.required_bytes,
+            "migration copy preflight predicts {} copy bytes, which must be strictly below the {} usable reservation bytes ({} bytes before allocator headroom)",
             predicted_copy_bytes,
-            feasibility.allocator_headroom_bytes,
+            feasibility.usable_capacity_bytes,
             capacity.usable_full_bucket_bytes,
         );
     }
@@ -476,6 +485,90 @@ fn print_reservation_capacity(capacity: &ReservationCapacity) {
         capacity.default_superblock_protected_bytes,
         capacity.device_tail_bytes,
     );
+}
+
+fn print_no_change_reservation_geometry(capacity: Option<&ReservationCapacity>) {
+    match capacity {
+        Some(capacity) => println!(
+            "MIGRATE_RESERVATION_GEOMETRY mode=no-change source=existing_reservation nouse_bitmap=predicted reservation_raw_extent_count={} reservation_raw_bytes={} reservation_bucket_size_bytes={} reservation_usable_full_bucket_count={} reservation_usable_full_bucket_bytes={} reservation_bucket_alignment_loss_bytes={} reservation_default_superblock_protected_bytes={} reservation_device_tail_bytes={}",
+            capacity.raw_extent_count,
+            capacity.raw_bytes,
+            capacity.bucket_size_bytes,
+            capacity.usable_full_bucket_count,
+            capacity.usable_full_bucket_bytes,
+            capacity.bucket_alignment_loss_bytes,
+            capacity.default_superblock_protected_bytes,
+            capacity.device_tail_bytes,
+        ),
+        None => println!(
+            "MIGRATE_RESERVATION_GEOMETRY mode=no-change source=unavailable nouse_bitmap=not_created"
+        ),
+    }
+}
+
+fn print_unavailable_copy_feasibility(predicted_copy_bytes: u64) {
+    println!(
+        "MIGRATE_COPY_FEASIBILITY verdict=unavailable predicted_copy_bytes={} reservation_usable_full_bucket_bytes=0 allocator_headroom_bytes=0 usable_capacity_bytes=0 required_bytes=0",
+        predicted_copy_bytes,
+    );
+}
+
+fn existing_no_change_reservation_capacity(
+    source_path: &Path,
+    source: &SourceInfo,
+    mapper: &ExtentMapper,
+    policy: MigrationCopyPolicy,
+    geometry: ReservationGeometry,
+    force: bool,
+    reservation_bytes: u64,
+) -> Result<Option<ReservationCapacity>> {
+    if !force {
+        return Ok(None);
+    }
+
+    let reservation_path = source_path.join("bcachefs");
+    let metadata = match fs::symlink_metadata(&reservation_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow!(
+                "cannot inspect existing migration reservation {}: {}",
+                reservation_path.display(),
+                error
+            ));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        bail!(
+            "existing migration reservation {} is not a regular file",
+            reservation_path.display()
+        );
+    }
+    if metadata.dev() != source.source_fs_dev {
+        bail!(
+            "existing migration reservation {} crosses filesystem devices",
+            reservation_path.display()
+        );
+    }
+    if metadata.len() < reservation_bytes {
+        return Ok(None);
+    }
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&reservation_path)
+        .map_err(|error| {
+            anyhow!(
+                "cannot read existing migration reservation {}: {}",
+                reservation_path.display(),
+                error
+            )
+        })?;
+    let block_sectors = u32::try_from(policy.block_bytes >> 9)
+        .map_err(|_| anyhow!("migration block size exceeds u32 sectors"))?;
+    let extents = map_reservation_extents(&file, block_sectors, mapper)?;
+    reservation_capacity(&extents, geometry).map(Some)
 }
 
 fn ranges_sort_merge(ranges: &mut Vec<CRange>) {
@@ -1101,14 +1194,24 @@ struct NoChangeStats {
     mapped_extents: u64,
     mapped_segments: u64,
     chunk_splits: u64,
+    raw_link_salvaged_bytes: u64,
     copy_accounting: CopyAccounting,
     mapping_failures: u64,
     eligible: bool,
 }
 
 impl NoChangeStats {
-    fn record_copy(&mut self, reason: CopyReason, bytes: u64) {
-        self.copy_accounting.record(reason, bytes);
+    fn record_copy(
+        &mut self,
+        reason: CopyReason,
+        bytes: u64,
+        policy: MigrationCopyPolicy,
+    ) -> Result<()> {
+        let allocated_bytes = copy_write_bytes(bytes, policy.block_bytes)
+            .map_err(|error| anyhow!("no-change copy accounting failed: {error}"))?;
+        self.copy_accounting
+            .record_with_allocation(reason, bytes, allocated_bytes);
+        Ok(())
     }
 }
 
@@ -1184,7 +1287,7 @@ fn scan_no_change_file(
                 continue;
             }
             ExtentDisposition::Copy(reason) => {
-                stats.record_copy(reason, visible_len);
+                stats.record_copy(reason, visible_len, policy)?;
                 continue;
             }
             ExtentDisposition::Unstable => unreachable!(),
@@ -1200,7 +1303,7 @@ fn scan_no_change_file(
                     error
                 );
                 stats.mapping_failures = stats.mapping_failures.saturating_add(1);
-                stats.record_copy(CopyReason::RawMappingUnavailable, visible_len);
+                stats.record_copy(CopyReason::RawMappingUnavailable, visible_len, policy)?;
                 continue;
             }
         };
@@ -1238,10 +1341,30 @@ fn scan_no_change_file(
                 .physical
                 .checked_add(physical_offset)
                 .ok_or_else(|| anyhow!("no-change physical offset overflows"))?;
-            if let Some(reason) = classify_segment(copy_start, link_physical, copy_len, policy) {
-                stats.record_copy(reason, copy_len);
-            } else {
-                stats.linked = stats.linked.saturating_add(copy_len);
+            let plan = plan_raw_segment(
+                copy_start,
+                link_physical,
+                copy_len,
+                metadata.len(),
+                policy,
+            )
+            .map_err(|error| anyhow!("no-change raw segment plan for {} failed: {error}", path.display()))?;
+            stats.raw_link_salvaged_bytes = stats
+                .raw_link_salvaged_bytes
+                .checked_add(plan.raw_link_salvaged_bytes)
+                .ok_or_else(|| anyhow!("no-change raw link salvage counter overflow"))?;
+            for span in plan.spans() {
+                match span.disposition {
+                    RawSegmentDisposition::Copy(reason) => {
+                        stats.record_copy(reason, span.len, policy)?;
+                    }
+                    RawSegmentDisposition::Link => {
+                        stats.linked = stats
+                            .linked
+                            .checked_add(span.len)
+                            .ok_or_else(|| anyhow!("no-change linked byte counter overflow"))?;
+                    }
+                }
             }
         }
     }
@@ -1296,7 +1419,11 @@ fn scan_no_change_tree(
                 let target = fs::read_link(&child)
                     .map_err(|e| anyhow!("cannot read symbolic link {}: {}", child.display(), e))?;
                 stats.symlinks = stats.symlinks.saturating_add(1);
-                stats.record_copy(CopyReason::Symlink, target.as_os_str().as_bytes().len() as u64);
+                stats.record_copy(
+                    CopyReason::Symlink,
+                    target.as_os_str().as_bytes().len() as u64,
+                    policy,
+                )?;
             } else if file_type.is_file() {
                 if skipped_inode == Some(child_meta.ino()) {
                     continue;
@@ -1351,7 +1478,7 @@ fn print_no_change_plan(stats: &NoChangeStats) -> Result<()> {
     let copied = &stats.copy_accounting;
     print_copy_reasons("no-change", copied)?;
     println!(
-        "MIGRATE_PLAN mode=no-change directories={} files={} symlinks={} special={} total_input_bytes={} linked_bytes={} copied_bytes={} copied_shared_bytes={} copied_inline_bytes={} copied_encoded_bytes={} copied_encrypted_bytes={} copied_not_aligned_bytes={} copied_tail_bytes={} copied_merged_bytes={} copied_future_flags_bytes={} copied_reservation_overlap_bytes={} copied_raw_unaligned_bytes={} copied_raw_mapping_unavailable_bytes={} copied_unstable_bytes={} copied_symlink_bytes={} copied_other_bytes={} unwritten_hole_bytes={} unstable_extent_bytes={} mapped_extent_count={} mapped_segment_count={} chunk_split_count={} mapping_failures={}",
+        "MIGRATE_PLAN mode=no-change directories={} files={} symlinks={} special={} total_input_bytes={} linked_bytes={} copied_bytes={} copy_allocated_bytes={} copied_shared_bytes={} copied_inline_bytes={} copied_encoded_bytes={} copied_encrypted_bytes={} copied_not_aligned_bytes={} copied_tail_bytes={} copied_merged_bytes={} copied_future_flags_bytes={} copied_reservation_overlap_bytes={} copied_raw_unaligned_bytes={} copied_raw_unaligned_head_bytes={} copied_raw_unaligned_tail_bytes={} copied_raw_unaligned_unsalvageable_bytes={} copied_raw_mapping_unavailable_bytes={} copied_unstable_bytes={} copied_symlink_bytes={} copied_other_bytes={} raw_link_salvaged_bytes={} unwritten_hole_bytes={} unstable_extent_bytes={} mapped_extent_count={} mapped_segment_count={} chunk_split_count={} mapping_failures={}",
         stats.directories,
         stats.files,
         stats.symlinks,
@@ -1359,6 +1486,7 @@ fn print_no_change_plan(stats: &NoChangeStats) -> Result<()> {
         stats.total_input,
         stats.linked,
         copied.copied_bytes,
+        copied.allocated_copy_bytes,
         copied.shared,
         copied.inline,
         copied.encoded,
@@ -1368,11 +1496,15 @@ fn print_no_change_plan(stats: &NoChangeStats) -> Result<()> {
         copied.merged,
         copied.future_flags,
         copied.reservation_overlap,
-        copied.raw_unaligned,
+        copied.raw_unaligned_bytes(),
+        copied.raw_unaligned_head,
+        copied.raw_unaligned_tail,
+        copied.raw_unaligned_unsalvageable,
         copied.raw_mapping_unavailable,
         copied.unstable,
         copied.symlink,
         copied.other,
+        stats.raw_link_salvaged_bytes,
         stats.unwritten,
         stats.unstable,
         stats.mapped_extents,
@@ -1402,13 +1534,23 @@ fn run_no_change(
             io::Error::from_raw_os_error(e)
         )
     })?;
-    let (_, policy) = configure_migration_device(&mut fs_opts, &mut c_dev, superblock_size)?;
+    let (reservation_geometry, policy) =
+        configure_migration_device(&mut fs_opts, &mut c_dev, superblock_size)?;
     println!(
         "MIGRATE_COPY_POLICY mode=no-change candidate_block_bytes={} reserved_superblock_end={}",
         policy.block_bytes,
         policy.reserved_superblock_end,
     );
     let mapper = refresh_source_mapper(source_path, source)?;
+    let existing_reservation_capacity = existing_no_change_reservation_capacity(
+        source_path,
+        source,
+        &mapper,
+        policy,
+        reservation_geometry,
+        force,
+        c_dev.fs_size / 10,
+    )?;
     let skipped_inode = if force {
         let reservation_path = source_path.join("bcachefs");
         fs::symlink_metadata(&reservation_path)
@@ -1426,6 +1568,13 @@ fn run_no_change(
         }
     };
     print_no_change_plan(&stats)?;
+    print_no_change_reservation_geometry(existing_reservation_capacity.as_ref());
+    match existing_reservation_capacity.as_ref() {
+        Some(capacity) => {
+            ensure_copy_feasibility(capacity, stats.copy_accounting.allocated_copy_bytes)?;
+        }
+        None => print_unavailable_copy_feasibility(stats.copy_accounting.allocated_copy_bytes),
+    }
     let eligible = stats.eligible;
     println!(
         "MIGRATE_RESULT eligible={}",
@@ -1544,8 +1693,10 @@ fn migrate_fs(
         println!("MIGRATE_COPY_FEASIBILITY verdict=reject reason=unstable_extent");
         bail!("migration copy preflight found unstable source extents after sync");
     }
-    let _copy_feasibility =
-        ensure_copy_feasibility(&reservation_capacity, preflight_stats.copy_accounting.copied_bytes)?;
+    let _copy_feasibility = ensure_copy_feasibility(
+        &reservation_capacity,
+        preflight_stats.copy_accounting.allocated_copy_bytes,
+    )?;
 
     // Find superblock location within reserved extents
     let (sb_offset, sb_end) = find_superblock_space(
@@ -1640,7 +1791,7 @@ fn migrate_fs(
         refreshed_mapper,
         nouse_state.allocatable_bytes,
         _copy_feasibility.allocator_headroom_bytes,
-        preflight_stats.copy_accounting.copied_bytes,
+        preflight_stats.copy_accounting.allocated_copy_bytes,
     );
     // Pre-populate with metadata reservation ranges
     for e in &extents {
@@ -2047,26 +2198,55 @@ mod tests {
         let feasibility = copy_feasibility(&capacity, 49_430_093_395);
 
         assert_eq!(feasibility.allocator_headroom_bytes, 6_843_662_336);
+        assert_eq!(feasibility.usable_capacity_bytes, 47_905_636_352);
         assert_eq!(feasibility.required_bytes, 56_273_755_731);
         assert!(!feasibility.fits);
     }
 
     #[test]
-    fn migration_copy_policy_reserves_default_superblock_before_alignment() {
+    fn copy_feasibility_requires_strictly_less_than_usable_capacity() {
+        let capacity = ReservationCapacity {
+            raw_extent_count: 0,
+            raw_bytes: 0,
+            bucket_size_bytes: 0,
+            default_superblock_protected_bytes: 0,
+            device_tail_bytes: 0,
+            bucket_alignment_loss_bytes: 0,
+            usable_full_bucket_count: 0,
+            usable_full_bucket_bytes: 54_749_298_688,
+        };
+        let usable_capacity_bytes = copy_feasibility(&capacity, 0).usable_capacity_bytes;
+
+        assert!(!copy_feasibility(&capacity, usable_capacity_bytes).fits);
+        assert!(copy_feasibility(&capacity, usable_capacity_bytes - 1).fits);
+    }
+
+    #[test]
+    fn raw_segment_plan_reserves_default_superblock_before_alignment() {
         let policy = MigrationCopyPolicy {
             block_bytes: 4096,
             reserved_superblock_end: 8192,
         };
 
-        assert_eq!(
-            classify_segment(0, 4096, 4096, policy),
-            Some(CopyReason::ReservationOverlap),
-        );
-        assert_eq!(
-            classify_segment(0, 8192, 2048, policy),
-            Some(CopyReason::RawUnaligned),
-        );
-        assert_eq!(classify_segment(0, 8192, 4096, policy), None);
+        let reserved = plan_raw_segment(0, 4096, 4096, 4096, policy).unwrap();
+        assert!(matches!(
+            reserved.spans(),
+            [span] if span.disposition
+                == RawSegmentDisposition::Copy(CopyReason::ReservationOverlap)
+        ));
+
+        let unaligned = plan_raw_segment(0, 8192, 2048, 2048, policy).unwrap();
+        assert!(matches!(
+            unaligned.spans(),
+            [span] if span.disposition
+                == RawSegmentDisposition::Copy(CopyReason::RawUnalignedUnsalvageable)
+        ));
+
+        let linked = plan_raw_segment(0, 8192, 4096, 4096, policy).unwrap();
+        assert!(matches!(
+            linked.spans(),
+            [span] if span.disposition == RawSegmentDisposition::Link
+        ));
     }
 
     #[test]

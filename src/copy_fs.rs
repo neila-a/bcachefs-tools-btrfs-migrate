@@ -27,8 +27,8 @@ use bcachefs_kernel::fs::Fs;
 use crate::util::AlignedBuf;
 use crate::btrfs_migrate::{ExtentMapper, PhysicalSegment};
 use crate::migration_copy_policy::{
-    classify_extent, classify_segment, CopyAccounting, CopyReason, ExtentDisposition,
-    MigrationCopyPolicy,
+    classify_extent, plan_raw_segment, CopyAccounting, CopyReason, ExtentDisposition,
+    MigrationCopyPolicy, RawSegmentDisposition,
 };
 
 const BCACHEFS_ROOT_INO: u64 = 4096;
@@ -276,7 +276,9 @@ pub struct CopyFsState {
     pub total_files:    u64,
     pub total_input:    u64,
     pub total_wrote:    u64,
+    total_allocated_wrote: u64,
     pub total_linked:   u64,
+    raw_link_salvaged_bytes: u64,
     pub total_unwritten: u64,
     pub total_unstable: u64,
     pub mapped_extents: u64,
@@ -314,8 +316,10 @@ impl CopyFsState {
             total_files:    0,
             total_input:    0,
             total_wrote:    0,
+            total_allocated_wrote: 0,
             total_linked:   0,
-            total_unwritten:  0,
+            raw_link_salvaged_bytes: 0,
+            total_unwritten: 0,
             total_unstable:   0,
             mapped_extents:   0,
             mapped_segments:  0,
@@ -356,8 +360,10 @@ impl CopyFsState {
             total_files:    0,
             total_input:    0,
             total_wrote:    0,
+            total_allocated_wrote: 0,
             total_linked:   0,
-            total_unwritten:  0,
+            raw_link_salvaged_bytes: 0,
+            total_unwritten: 0,
             total_unstable:   0,
             mapped_extents:   0,
             mapped_segments:  0,
@@ -396,9 +402,11 @@ fn check_cancellation_probe(probe: Option<fn() -> bool>) -> Result<(), BchError>
 }
 
 impl CopyFsState {
-    fn record_copy(&mut self, reason: CopyReason, bytes: u64) {
-        self.copy_accounting.record(reason, bytes);
+    fn record_copy(&mut self, reason: CopyReason, bytes: u64, allocated_bytes: u64) {
+        self.copy_accounting
+            .record_with_allocation(reason, bytes, allocated_bytes);
         self.total_wrote = self.copy_accounting.copied_bytes;
+        self.total_allocated_wrote = self.copy_accounting.allocated_copy_bytes;
     }
 
     fn start_progress(&mut self, fs: &Fs, entries_total: u64) {
@@ -443,10 +451,10 @@ impl CopyFsState {
 
         let reservation_remaining_bytes = self
             .reservation_allocatable_bytes
-            .saturating_sub(self.total_wrote);
+            .saturating_sub(self.total_allocated_wrote);
         let reservation_required_remaining_bytes = self
             .reservation_predicted_copy_bytes
-            .saturating_sub(self.total_wrote)
+            .saturating_sub(self.total_allocated_wrote)
             .saturating_add(self.reservation_allocator_headroom_bytes);
         eprintln!(
             "MIGRATE_PROGRESS entries_done={} entries_total={} non_directories_done={} directories_done={} linked_bytes={} copied_bytes={} elapsed_seconds={} reservation_allocatable_bytes={} reservation_copied_bytes={} reservation_predicted_copy_bytes={} reservation_allocator_headroom_bytes={} reservation_required_remaining_bytes={} reservation_remaining_bytes={}",
@@ -458,7 +466,7 @@ impl CopyFsState {
             self.total_wrote,
             self.progress_started.elapsed().as_secs(),
             self.reservation_allocatable_bytes,
-            self.total_wrote,
+            self.total_allocated_wrote,
             self.reservation_predicted_copy_bytes,
             self.reservation_allocator_headroom_bytes,
             reservation_required_remaining_bytes,
@@ -805,7 +813,7 @@ fn copy_data(
             .map_err(rustix_err)?;
 
         write_data(fs, dst_inode, pos, &buf)?;
-        s.record_copy(reason, len as u64);
+        s.record_copy(reason, len as u64, padded as u64);
         s.emit_progress(fs, false);
         pos += len as u64;
     }
@@ -826,6 +834,13 @@ fn link_data(
     };
     dst.bi_sectors = (dst.bi_sectors as i64 + sectors_delta) as u64;
     ret_to_result(ret)
+}
+
+#[derive(Clone, Copy)]
+struct PendingRawLink {
+    logical: u64,
+    physical: u64,
+    len: u64,
 }
 
 fn copy_link(
@@ -851,7 +866,7 @@ fn copy_link(
     let padded = (link_len.div_ceil(block_size) * block_size) as usize;
 
     write_data(fs, dst, 0, &buf[..padded])?;
-    s.record_copy(CopyReason::Symlink, link_len);
+    s.record_copy(CopyReason::Symlink, link_len, padded as u64);
     Ok(())
 }
 
@@ -900,6 +915,11 @@ fn link_file_data(
         return Err(BchError::from_raw(-libc::EBUSY));
     }
 
+    let policy = MigrationCopyPolicy {
+        block_bytes: block_size,
+        reserved_superblock_end: s.reserve_start,
+    };
+    let mut pending_links = Vec::new();
     for extent in extents {
         s.check_cancellation()?;
         if extent.fe_length == 0 {
@@ -1028,35 +1048,46 @@ fn link_file_data(
                 .physical
                 .checked_add(physical_offset)
                 .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
-
-            let reason = classify_segment(
-                copy_start,
-                link_physical,
-                copy_len,
-                MigrationCopyPolicy {
-                    block_bytes: block_size,
-                    reserved_superblock_end: s.reserve_start,
-                },
-            );
-
-            if let Some(reason) = reason {
-                copy_data(fs, s, dst, src_fd, copy_start, copy_end, reason)?;
-                continue;
-            }
-
-            range_add(&mut s.extents, link_physical, copy_len)?;
-            link_data(
-                fs,
-                dst,
-                copy_start,
-                link_physical,
-                copy_len,
-            )?;
-            s.total_linked = s
-                .total_linked
-                .checked_add(copy_len)
+            let plan = plan_raw_segment(copy_start, link_physical, copy_len, src_size, policy)
+                .map_err(|error| {
+                    eprintln!(
+                        "Unsafe raw FIEMAP segment in {}: {}",
+                        src_path.to_string_lossy(),
+                        error,
+                    );
+                    BchError::from_raw(-libc::EIO)
+                })?;
+            s.raw_link_salvaged_bytes = s
+                .raw_link_salvaged_bytes
+                .checked_add(plan.raw_link_salvaged_bytes)
                 .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+
+            for span in plan.spans() {
+                match span.disposition {
+                    RawSegmentDisposition::Copy(reason) => {
+                        let copy_end = span
+                            .file_offset
+                            .checked_add(span.len)
+                            .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
+                        copy_data(fs, s, dst, src_fd, span.file_offset, copy_end, reason)?;
+                    }
+                    RawSegmentDisposition::Link => pending_links.push(PendingRawLink {
+                        logical: span.file_offset,
+                        physical: span.physical_offset,
+                        len: span.len,
+                    }),
+                }
+            }
         }
+    }
+    for link in pending_links {
+        s.check_cancellation()?;
+        range_add(&mut s.extents, link.physical, link.len)?;
+        link_data(fs, dst, link.logical, link.physical, link.len)?;
+        s.total_linked = s
+            .total_linked
+            .checked_add(link.len)
+            .ok_or_else(|| BchError::from_raw(-libc::EOVERFLOW))?;
     }
 
     Ok(())
@@ -1209,7 +1240,7 @@ fn copy_sync_file_range(
                 break;
             }
             write_data(fs, dst, start + m.start, &src_buf[m.start as usize..m.end as usize])?;
-            s.record_copy(CopyReason::Other, m.end - m.start);
+            s.record_copy(CopyReason::Other, m.end - m.start, m.end - m.start);
         }
 
         start += b as u64;
@@ -1658,17 +1689,19 @@ pub fn copy_fs(
         print_human_readable(s.total_linked);
         println!();
     }
-    if s.copy_accounting.reason_sum() != s.total_wrote {
+    if !s.copy_accounting.is_consistent() {
         eprintln!(
-            "MIGRATE_COPY_REASONS_INVALID copied_bytes={} reason_bytes={}",
+            "MIGRATE_COPY_REASONS_INVALID copied_bytes={} copy_allocated_bytes={} reason_bytes={}",
             s.total_wrote,
+            s.copy_accounting.allocated_copy_bytes,
             s.copy_accounting.reason_sum(),
         );
         return Err(BchError::from_raw(-libc::EIO));
     }
     println!(
-        "MIGRATE_COPY_REASONS mode=migrate copied_bytes={} copied_shared_bytes={} copied_inline_bytes={} copied_encoded_bytes={} copied_encrypted_bytes={} copied_not_aligned_bytes={} copied_tail_bytes={} copied_merged_bytes={} copied_future_flags_bytes={} copied_reservation_overlap_bytes={} copied_raw_unaligned_bytes={} copied_raw_mapping_unavailable_bytes={} copied_unstable_bytes={} copied_symlink_bytes={} copied_other_bytes={}",
+        "MIGRATE_COPY_REASONS mode=migrate copied_bytes={} copy_allocated_bytes={} copied_shared_bytes={} copied_inline_bytes={} copied_encoded_bytes={} copied_encrypted_bytes={} copied_not_aligned_bytes={} copied_tail_bytes={} copied_merged_bytes={} copied_future_flags_bytes={} copied_reservation_overlap_bytes={} copied_raw_unaligned_bytes={} copied_raw_unaligned_head_bytes={} copied_raw_unaligned_tail_bytes={} copied_raw_unaligned_unsalvageable_bytes={} copied_raw_mapping_unavailable_bytes={} copied_unstable_bytes={} copied_symlink_bytes={} copied_other_bytes={}",
         s.total_wrote,
+        s.copy_accounting.allocated_copy_bytes,
         s.copy_accounting.shared,
         s.copy_accounting.inline,
         s.copy_accounting.encoded,
@@ -1678,7 +1711,10 @@ pub fn copy_fs(
         s.copy_accounting.merged,
         s.copy_accounting.future_flags,
         s.copy_accounting.reservation_overlap,
-        s.copy_accounting.raw_unaligned,
+        s.copy_accounting.raw_unaligned_bytes(),
+        s.copy_accounting.raw_unaligned_head,
+        s.copy_accounting.raw_unaligned_tail,
+        s.copy_accounting.raw_unaligned_unsalvageable,
         s.copy_accounting.raw_mapping_unavailable,
         s.copy_accounting.unstable,
         s.copy_accounting.symlink,
@@ -1707,10 +1743,11 @@ pub fn copy_fs(
         }
     }
     println!(
-        "MIGRATE_PLAN mode=migrate total_input_bytes={} linked_bytes={} copied_bytes={} copied_shared_bytes={} copied_inline_bytes={} copied_encoded_bytes={} copied_encrypted_bytes={} copied_not_aligned_bytes={} copied_tail_bytes={} copied_merged_bytes={} copied_future_flags_bytes={} copied_reservation_overlap_bytes={} copied_raw_unaligned_bytes={} copied_raw_mapping_unavailable_bytes={} copied_unstable_bytes={} copied_symlink_bytes={} copied_other_bytes={} unwritten_hole_bytes={} unstable_extent_bytes={} mapped_extent_count={} mapped_segment_count={} chunk_split_count={}",
+        "MIGRATE_PLAN mode=migrate total_input_bytes={} linked_bytes={} copied_bytes={} copy_allocated_bytes={} copied_shared_bytes={} copied_inline_bytes={} copied_encoded_bytes={} copied_encrypted_bytes={} copied_not_aligned_bytes={} copied_tail_bytes={} copied_merged_bytes={} copied_future_flags_bytes={} copied_reservation_overlap_bytes={} copied_raw_unaligned_bytes={} copied_raw_unaligned_head_bytes={} copied_raw_unaligned_tail_bytes={} copied_raw_unaligned_unsalvageable_bytes={} copied_raw_mapping_unavailable_bytes={} copied_unstable_bytes={} copied_symlink_bytes={} copied_other_bytes={} raw_link_salvaged_bytes={} unwritten_hole_bytes={} unstable_extent_bytes={} mapped_extent_count={} mapped_segment_count={} chunk_split_count={}",
         s.total_input,
         s.total_linked,
         s.total_wrote,
+        s.copy_accounting.allocated_copy_bytes,
         s.copy_accounting.shared,
         s.copy_accounting.inline,
         s.copy_accounting.encoded,
@@ -1720,11 +1757,15 @@ pub fn copy_fs(
         s.copy_accounting.merged,
         s.copy_accounting.future_flags,
         s.copy_accounting.reservation_overlap,
-        s.copy_accounting.raw_unaligned,
+        s.copy_accounting.raw_unaligned_bytes(),
+        s.copy_accounting.raw_unaligned_head,
+        s.copy_accounting.raw_unaligned_tail,
+        s.copy_accounting.raw_unaligned_unsalvageable,
         s.copy_accounting.raw_mapping_unavailable,
         s.copy_accounting.unstable,
         s.copy_accounting.symlink,
         s.copy_accounting.other,
+        s.raw_link_salvaged_bytes,
         s.total_unwritten,
         s.total_unstable,
         s.mapped_extents,

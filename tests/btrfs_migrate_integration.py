@@ -180,7 +180,9 @@ COPY_REASON_FIELDS = (
     "copied_merged_bytes",
     "copied_future_flags_bytes",
     "copied_reservation_overlap_bytes",
-    "copied_raw_unaligned_bytes",
+    "copied_raw_unaligned_head_bytes",
+    "copied_raw_unaligned_tail_bytes",
+    "copied_raw_unaligned_unsalvageable_bytes",
     "copied_raw_mapping_unavailable_bytes",
     "copied_unstable_bytes",
     "copied_symlink_bytes",
@@ -196,7 +198,13 @@ def _copy_reasons(output: str, mode: str) -> dict[str, int]:
     assert match, f"missing {mode} copy reason accounting:\n{output}"
     fields = dict(field.split("=", 1) for field in match["fields"].split())
     parsed = {name: int(fields[name]) for name in COPY_REASON_FIELDS}
+    assert int(fields["copied_raw_unaligned_bytes"]) == (
+        parsed["copied_raw_unaligned_head_bytes"]
+        + parsed["copied_raw_unaligned_tail_bytes"]
+        + parsed["copied_raw_unaligned_unsalvageable_bytes"]
+    ), output
     assert int(fields["copied_bytes"]) == sum(parsed.values()), output
+    assert int(fields["copy_allocated_bytes"]) >= int(fields["copied_bytes"]), output
     return parsed
 
 
@@ -215,6 +223,8 @@ def _copy_policy(output: str, mode: str) -> dict[str, int]:
 PLAN_FIELDS = (
     "linked_bytes",
     "copied_bytes",
+    "copy_allocated_bytes",
+    "raw_link_salvaged_bytes",
     "unwritten_hole_bytes",
     "unstable_extent_bytes",
     "mapped_extent_count",
@@ -263,12 +273,12 @@ def _migration_progress(output: str) -> list[dict[str, int]]:
     ), output
     assert all(
         record["reservation_allocatable_bytes"] > 0
-        and record["reservation_copied_bytes"] == record["copied_bytes"]
+        and record["reservation_copied_bytes"] >= record["copied_bytes"]
         and record["reservation_remaining_bytes"]
-        == record["reservation_allocatable_bytes"] - record["copied_bytes"]
+        == record["reservation_allocatable_bytes"] - record["reservation_copied_bytes"]
         and record["reservation_predicted_copy_bytes"]
         + record["reservation_allocator_headroom_bytes"]
-        <= record["reservation_allocatable_bytes"]
+        < record["reservation_allocatable_bytes"]
         for record in parsed
     ), output
     return parsed
@@ -603,6 +613,22 @@ def _write_copy_pressure_fixture(image: BtrfsImage) -> None:
         file.flush()
         os.fsync(file.fileno())
     _run(["cp", "--reflink=always", source, image.mountpoint / "shared-clone"])
+    image.sync()
+
+RAW_ALIGNMENT_FILE_BYTES = 8 * 1024 * 1024 + 137
+
+
+def _write_raw_alignment_fixture(image: BtrfsImage) -> None:
+    """Create a data extent with a complete raw-linkable middle and EOF tail."""
+    image.assert_writable_top_level()
+    block = bytes(range(256)) * (4096 // 256)
+    path = image.mountpoint / "raw-alignment-tail"
+    with path.open("wb") as file:
+        for _ in range((RAW_ALIGNMENT_FILE_BYTES - 137) // len(block)):
+            file.write(block)
+        file.write(bytes(range(137)))
+        file.flush()
+        os.fsync(file.fileno())
     image.sync()
 
 
@@ -1060,52 +1086,47 @@ def test_copy_capacity_preflight_rejects_before_candidate_writes(
     reservation_before = _reservation_state(btrfs_image)
     _assert_manifest(btrfs_image.mountpoint, manifest)
 
-    legacy = _start_migrate(
-        btrfs_image,
-        "-F",
-        "-f",
-        env={
-            **os.environ,
-            "BCACHEFS_TEST_BYPASS_COPY_FEASIBILITY": "1",
-            "BCACHEFS_TEST_MIGRATE_STOP_TRACE": "1",
-        },
-    )
-    legacy_output = _wait_for_migrate_self_termination(
-        legacy, GOING_RO_ABORT_TIMEOUT_SECONDS
-    )
-    assert legacy.returncode != 0, legacy_output
-    assert "MIGRATE_RESERVATION_NOUSE " in legacy_output, legacy_output
-    assert "no_buckets_found" in legacy_output, legacy_output
+    retry_plan = _migrate(btrfs_image, "--no-change", "-F", "-f")
+    assert retry_plan.returncode != 0, retry_plan.stdout
     assert (
-        "bch2_btree_write_buffer_flush_locked(): fatal error no_buckets_found"
-        in legacy_output
-    ), legacy_output
-    for marker in (
-        "MIGRATE_STOP stage=fatal_error",
-        "MIGRATE_STOP stage=emergency_ro",
-        "MIGRATE_STOP stage=copy_return result=error",
-        "MIGRATE_STOP stage=fs_exit_begin",
-        "MIGRATE_STOP stage=fs_stop_enter",
-        "MIGRATE_STOP stage=write_buffer_flush_begin",
-        "MIGRATE_STOP stage=emergency_write_cancel_complete",
-        "MIGRATE_STOP stage=fs_stop_return",
-        "MIGRATE_STOP stage=fs_exit_complete result=error",
-    ):
-        assert marker in legacy_output, legacy_output
-    assert legacy_output.index("MIGRATE_STOP stage=fatal_error") < legacy_output.index(
-        "MIGRATE_STOP stage=emergency_ro"
-    )
-    assert legacy_output.index(
-        "MIGRATE_STOP stage=copy_return result=error"
-    ) < legacy_output.index("MIGRATE_STOP stage=fs_exit_begin")
-    assert legacy_output.index(
-        "MIGRATE_STOP stage=fs_stop_enter"
-    ) < legacy_output.index("MIGRATE_STOP stage=fs_stop_return")
-    assert legacy_output.index(
-        "MIGRATE_STOP stage=fs_stop_return"
-    ) < legacy_output.index("MIGRATE_STOP stage=fs_exit_complete result=error")
+        "MIGRATE_RESERVATION_GEOMETRY mode=no-change "
+        "source=existing_reservation nouse_bitmap=predicted"
+    ) in retry_plan.stdout, retry_plan.stdout
+    assert "MIGRATE_COPY_FEASIBILITY verdict=reject" in retry_plan.stdout, retry_plan.stdout
+    assert "MIGRATE_RESERVATION_NOUSE " not in retry_plan.stdout, retry_plan.stdout
+    assert "initializing new filesystem" not in retry_plan.stdout, retry_plan.stdout
     assert _reservation_state(btrfs_image) == reservation_before
     _assert_manifest(btrfs_image.mountpoint, manifest)
+
+
+def test_raw_alignment_tail_salvages_middle_raw_link(
+    btrfs_image: BtrfsImage,
+) -> None:
+    _write_raw_alignment_fixture(btrfs_image)
+    manifest = _manifest(btrfs_image.mountpoint)
+
+    no_change = _migrate(btrfs_image, "--no-change", "-f")
+    assert no_change.returncode == 0, no_change.stdout
+    planned_reasons = _copy_reasons(no_change.stdout, "no-change")
+    planned_stats = _migration_plan(no_change.stdout, "no-change")
+    assert planned_reasons["copied_raw_unaligned_tail_bytes"] == 137
+    assert planned_reasons["copied_raw_unaligned_unsalvageable_bytes"] == 0
+    assert planned_stats["raw_link_salvaged_bytes"] >= RAW_ALIGNMENT_FILE_BYTES - 137
+
+    migrated = _migrate(btrfs_image, "-f")
+    assert migrated.returncode == 0, migrated.stdout
+    assert _copy_reasons(migrated.stdout, "preflight") == planned_reasons
+    assert _copy_reasons(migrated.stdout, "migrate") == planned_reasons
+    assert _migration_plan(migrated.stdout, "migrate") == planned_stats
+
+    candidate = btrfs_image.mount_bcachefs_candidate_readonly(
+        _alternate_superblock(migrated.stdout)
+    )
+    try:
+        _assert_manifest(candidate, manifest)
+    finally:
+        btrfs_image.unmount_bcachefs_candidate()
+
 
 def test_retry_no_change_classifier_matches_runtime_with_existing_reservation(
     btrfs_image: BtrfsImage,
@@ -1148,6 +1169,12 @@ def test_retry_no_change_classifier_matches_runtime_with_existing_reservation(
     assert retry_plan.returncode == 0, retry_plan.stdout
     retry_reasons = _copy_reasons(retry_plan.stdout, "no-change")
     retry_stats = _migration_plan(retry_plan.stdout, "no-change")
+    assert (
+        "MIGRATE_RESERVATION_GEOMETRY mode=no-change "
+        "source=existing_reservation nouse_bitmap=predicted"
+    ) in retry_plan.stdout, retry_plan.stdout
+    assert "MIGRATE_COPY_FEASIBILITY verdict=fit" in retry_plan.stdout, retry_plan.stdout
+    assert "MIGRATE_RESERVATION_NOUSE " not in retry_plan.stdout, retry_plan.stdout
     assert retry_reasons == initial_reasons
     assert retry_stats == initial_stats
 
