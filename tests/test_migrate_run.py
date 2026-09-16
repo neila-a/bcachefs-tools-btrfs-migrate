@@ -6,6 +6,8 @@ import struct
 import sys
 import uuid
 
+from types import SimpleNamespace
+
 from pathlib import Path
 
 import pytest
@@ -109,3 +111,49 @@ def test_unrelated_real_btrfs_mount_is_not_rejected_as_a_test_fixture() -> None:
     )
 
     module.ensure_no_test_btrfs_mounts([real_mount])
+
+
+def test_main_passes_the_migrate_root_with_dash_f(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_runner_module()
+    snapshot = tmp_path / "run" / "binary" / "bcachefs"
+    launched: list[str] = []
+
+    monkeypatch.setattr(module, "discover_btrfs_mounts", lambda: [])
+    monkeypatch.setattr(module, "ensure_no_test_btrfs_mounts", lambda _mounts: None)
+    monkeypatch.setattr(
+        module,
+        "create_run_snapshot",
+        lambda _binary, _run_dir: (snapshot, {"binary": {"sha256": "fixture"}}),
+    )
+    monkeypatch.setattr(module, "verify_snapshot", lambda _snapshot, _manifest: None)
+
+    def fake_run(command: list[str], check: bool) -> SimpleNamespace:
+        assert check is False
+        launched.extend(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    args = SimpleNamespace(
+        source=Path("/fixture/source"),
+        binary=Path("/fixture/bcachefs"),
+        run_dir=tmp_path / "run",
+        watchdog=Path("/fixture/migrate-watchdog.py"),
+        migration_args=["--no-change", "-F"],
+    )
+
+    assert module.main(args) == 0
+    assert launched == [
+        sys.executable,
+        "/fixture/migrate-watchdog.py",
+        "--log-file",
+        str(tmp_path / "run" / "migrate-watchdog.log"),
+        "--",
+        str(snapshot),
+        "migrate",
+        "-f",
+        "/fixture/source",
+        "--no-change",
+        "-F",
+    ]

@@ -408,7 +408,7 @@ def main(args: argparse.Namespace) -> int:
             "--",
             os.fspath(snapshot),
             "migrate",
-            "--source",
+            "-f",
             os.fspath(args.source),
             *args.migration_args,
         ],
