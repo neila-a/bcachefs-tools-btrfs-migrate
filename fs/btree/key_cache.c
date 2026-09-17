@@ -12,6 +12,7 @@
  */
 
 #include "bcachefs.h"
+#include "alloc/foreground.h"
 
 #include "btree/cache.h"
 #include "btree/iter.h"
@@ -26,6 +27,157 @@
 #include "journal/reclaim.h"
 
 #include <linux/sched/mm.h>
+
+#ifndef __KERNEL__
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static atomic_bool test_going_ro_abort_active;
+static atomic_bool test_going_ro_abort_reported;
+static atomic_ulong test_going_ro_abort_split_attempts;
+static atomic_ulong test_going_ro_abort_flush_attempts;
+
+bool bch2_test_key_cache_going_ro_abort_enabled(void)
+{
+	static int enabled = -1;
+
+	if (likely(enabled >= 0))
+		return enabled;
+
+	return (enabled = !!getenv("BCACHEFS_TEST_GOING_RO_ABORT_REPRODUCER"));
+}
+
+bool bch2_test_key_cache_going_ro_abort_active(void)
+{
+	return atomic_load(&test_going_ro_abort_active);
+}
+
+
+int bch2_test_key_cache_going_ro_abort_dirty(struct bch_fs *c, u64 nr)
+{
+	for (u64 i = 0; i < nr; i++) {
+		CLASS(btree_trans, trans)(c);
+		int ret = lockrestart_do(trans, ({
+			CLASS(btree_iter, c_iter)(trans, BTREE_ID_inodes,
+						  SPOS(0, i, U32_MAX),
+						  BTREE_ITER_cached|BTREE_ITER_intent);
+			try(bch2_btree_iter_traverse(&c_iter));
+			CLASS(btree_iter, b_iter)(trans, BTREE_ID_inodes,
+						  SPOS(0, i, U32_MAX),
+						  BTREE_ITER_intent);
+			try(bch2_btree_iter_traverse(&b_iter));
+
+			struct bkey_s_c old = bkey_try(bch2_btree_iter_peek_slot(&b_iter));
+			try(!old.k || bkey_deleted(old.k) ? -EINVAL : 0);
+
+			struct bkey_i_cookie *insert =
+				errptr_try(bch2_trans_kmalloc(trans, sizeof(*insert)));
+			bkey_cookie_init(&insert->k_i);
+			insert->k.p = SPOS(0, i, U32_MAX);
+			insert->k.bversion.lo = i + 1;
+
+			try(bch2_trans_update(trans, &b_iter, &insert->k_i, 0));
+			bch2_trans_commit(trans, NULL, NULL,
+					   BCH_TRANS_COMMIT_no_enospc|
+					   BCH_TRANS_COMMIT_no_skip_noops);
+		}));
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+void bch2_test_key_cache_going_ro_abort_ready(struct bch_fs *c)
+{
+	fprintf(stderr,
+		"MIGRATE_ABORT_REPRODUCER_READY key_cache_nr_dirty=%lu key_cache_nr_keys=%lu\n",
+		atomic_long_read(&c->btree.key_cache.nr_dirty),
+		atomic_long_read(&c->btree.key_cache.nr_keys));
+}
+
+static void test_key_cache_going_ro_abort_exhaust_buckets(struct bch_fs *c)
+{
+	for_each_member_device(c, ca)
+		memset(ca->buckets_nouse, U8_MAX,
+		       BITS_TO_LONGS(ca->mi.nbuckets) * sizeof(unsigned long));
+}
+
+void bch2_test_key_cache_going_ro_abort_split_attempted(void)
+{
+	if (bch2_test_key_cache_going_ro_abort_active())
+		atomic_fetch_add(&test_going_ro_abort_split_attempts, 1);
+}
+
+static const char *
+test_key_cache_going_ro_abort_classification(const struct alloc_request *req, int ret)
+{
+	if (bch2_err_matches(ret, BCH_ERR_btree_cache_cannibalize_lock_blocked))
+		return "cannibalize_lock_blocked";
+	if (bch2_err_matches(ret, BCH_ERR_open_buckets_empty))
+		return "open_buckets_exhausted";
+	if (req->counters.skipped_need_journal_commit)
+		return "journal_seq_unusable";
+	if (req->counters.skipped_nouse)
+		return "nouse_exhausted";
+	if (bch2_err_matches(ret, BCH_ERR_no_buckets_found))
+		return "no_usable_buckets";
+	return "other";
+}
+
+void bch2_test_key_cache_going_ro_abort_reserve_get_result(struct bch_fs *c,
+							    const struct alloc_request *req,
+							    int ret)
+{
+	if (!bch2_test_key_cache_going_ro_abort_active() ||
+	    atomic_exchange(&test_going_ro_abort_reported, true))
+		return;
+
+	unsigned reserve_cache_nr;
+	mutex_lock(&c->btree.reserve_cache.lock);
+	reserve_cache_nr = c->btree.reserve_cache.nr;
+	mutex_unlock(&c->btree.reserve_cache.lock);
+
+	fprintf(stderr,
+		"MIGRATE_ABORT_DIAG classification=%s allocator_outcome=%s "
+		"key_cache_nr_dirty=%lu reserve_cache_nr=%u open_buckets_nr_free=%u "
+		"watermark=%s reserve_get_ret=%d complete_device_scans=%llu "
+		"split_attempts=%lu buckets_seen=%llu skipped_open=%llu "
+		"skipped_need_journal_commit=%llu skipped_nouse=%llu "
+		"skipped_mi_btree_bitmap=%llu trace_entries=%zu\n",
+		test_key_cache_going_ro_abort_classification(req, ret),
+		bch2_err_matches(ret, BCH_ERR_no_buckets_found)
+		? "no_usable_buckets" : bch2_err_str(ret),
+		atomic_long_read(&c->btree.key_cache.nr_dirty),
+		reserve_cache_nr,
+		READ_ONCE(c->allocator.open_buckets_nr_free),
+		bch2_watermarks[req->watermark],
+		ret,
+		req->counters.complete_device_scans,
+		atomic_load(&test_going_ro_abort_split_attempts),
+		req->counters.buckets_seen,
+		req->counters.skipped_open,
+		req->counters.skipped_need_journal_commit,
+		req->counters.skipped_nouse,
+		req->counters.skipped_mi_btree_bitmap,
+		req->trace.nr);
+
+	for (unsigned i = 0; i < req->trace.nr; i++) {
+		const alloc_trace_entry *t = req->trace.data + i;
+
+		fprintf(stderr,
+			"MIGRATE_ABORT_TRACE index=%u dev=%u retries=%u have_cl=%u "
+			"copygc_can_make_progress=%u err=%d wake_counter_snapshot=%u "
+			"free_buckets=%llu\n",
+			i, t->dev,
+			t->will_retry_all_devices + t->will_retry_target_devices +
+			t->will_retry_set_devices,
+			t->have_cl, t->copygc_can_make_progress, t->err,
+			t->wake_counter_snapshot, t->free_buckets);
+	}
+}
+#endif
 
 static inline bool btree_uses_pcpu_readers(enum btree_id id)
 {
@@ -608,6 +760,20 @@ int bch2_btree_key_cache_flush_going_ro(struct bch_fs *c)
 	if (!atomic_long_read(&bc->nr_dirty) ||
 	    bch2_journal_error(&c->journal))
 		return 0;
+#ifndef __KERNEL__
+	if (unlikely(bch2_test_key_cache_going_ro_abort_enabled())) {
+		if (!atomic_exchange(&test_going_ro_abort_active, true)) {
+			atomic_store(&test_going_ro_abort_reported, false);
+			atomic_store(&test_going_ro_abort_split_attempts, 0);
+			atomic_store(&test_going_ro_abort_flush_attempts, 0);
+			test_key_cache_going_ro_abort_exhaust_buckets(c);
+			fprintf(stderr, "MIGRATE_ABORT_REPRODUCER_CONSTRAINT mode=all_buckets_nouse\n");
+		}
+		fprintf(stderr, "MIGRATE_ABORT_LOOP key_cache_flush_attempts=%lu\n",
+			atomic_fetch_add(&test_going_ro_abort_flush_attempts, 1) + 1);
+	}
+#endif
+
 
 	guard(srcu)(&c->btree.trans.barrier);
 	CLASS(btree_trans, trans)(c);
@@ -666,6 +832,10 @@ rcu_done:;
 			if (ret &&
 			    !bch2_err_matches(ret, BCH_ERR_journal_reclaim_would_deadlock) &&
 			    !bch2_journal_error(&c->journal)) {
+#ifndef __KERNEL__
+				if (bch2_test_key_cache_going_ro_abort_active())
+					fprintf(stderr, "MIGRATE_ABORT_KEYCACHE result=%d\n", ret);
+#endif
 				bch_err_fn(c, ret);
 				return ret;
 			}

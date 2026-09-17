@@ -135,8 +135,10 @@ void bch2_fatal_error(struct bch_fs *c, const char *func, const char *fmt, ...)
 	va_end(args);
 
 	prt_newline(&msg.m);
+	bch2_test_migrate_stop_trace(c, "fatal_error");
 
 	bch2_fs_emergency_read_only(c, &msg.m);
+	bch2_test_migrate_stop_trace(c, "emergency_ro");
 	prt_printf(&msg.m, "fatal error - emergency read only");
 }
 

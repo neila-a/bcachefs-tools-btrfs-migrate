@@ -693,7 +693,11 @@ Enable whole filesystem encryption (chacha20/poly1305)
 .It Fl -no_passphrase
 Store master encryption key unencrypted in superblock
 .It Fl F
-Force, even if metadata file already exists
+Retry an existing migration reservation. Use
+.Dl bcachefs migrate -f /mnt/source
+for a fresh migration, and
+.Dl bcachefs migrate -F -f /mnt/source
+when the source already contains the reservation from an earlier migration.
 .El
 .It Nm Ic migrate-superblock Oo Ar options Oc Ar device
 Create default superblock after migrating

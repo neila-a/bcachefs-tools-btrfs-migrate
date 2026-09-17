@@ -73,6 +73,53 @@ static const size_t BCH_SIZEOF_FS_SYSFS_PATH = sizeof(struct fs_sysfs_path);
 static const unsigned long BCH_FS_IOC_FIEMAP = FS_IOC_FIEMAP;
 
 /*
+ * Btrfs source-migration UAPI.  Keep ioctl encodings and on-disk constants
+ * compiler-derived; Rust owns validation and logical-to-physical mapping.
+ */
+#include <linux/btrfs.h>
+#include <linux/btrfs_tree.h>
+#include <linux/magic.h>
+
+static const unsigned long BCH_BTRFS_IOC_FS_INFO = BTRFS_IOC_FS_INFO;
+static const unsigned long BCH_BTRFS_IOC_DEV_INFO = BTRFS_IOC_DEV_INFO;
+static const unsigned long BCH_BTRFS_IOC_GET_FEATURES = BTRFS_IOC_GET_FEATURES;
+static const unsigned long BCH_BTRFS_IOC_GET_SUBVOL_INFO = BTRFS_IOC_GET_SUBVOL_INFO;
+static const unsigned long BCH_BTRFS_IOC_TREE_SEARCH_V2 = BTRFS_IOC_TREE_SEARCH_V2;
+static const unsigned long BCH_BTRFS_SUPER_MAGIC = BTRFS_SUPER_MAGIC;
+
+static const unsigned long long BCH_BTRFS_CHUNK_TREE_OBJECTID = BTRFS_CHUNK_TREE_OBJECTID;
+static const unsigned long long BCH_BTRFS_ROOT_TREE_OBJECTID = BTRFS_ROOT_TREE_OBJECTID;
+static const unsigned long long BCH_BTRFS_FIRST_FREE_OBJECTID = BTRFS_FIRST_FREE_OBJECTID;
+static const unsigned long long BCH_BTRFS_LAST_FREE_OBJECTID =
+        BTRFS_LAST_FREE_OBJECTID;
+#define BCH_BTRFS_LAST_FREE_OBJECTID BTRFS_LAST_FREE_OBJECTID
+static const unsigned long long BCH_BTRFS_FIRST_CHUNK_TREE_OBJECTID = BTRFS_FIRST_CHUNK_TREE_OBJECTID;
+static const unsigned long long BCH_BTRFS_FS_TREE_OBJECTID = BTRFS_FS_TREE_OBJECTID;
+static const unsigned long long BCH_BTRFS_BLOCK_GROUP_DATA = BTRFS_BLOCK_GROUP_DATA;
+static const unsigned long long BCH_BTRFS_BLOCK_GROUP_SYSTEM = BTRFS_BLOCK_GROUP_SYSTEM;
+static const unsigned long long BCH_BTRFS_BLOCK_GROUP_METADATA = BTRFS_BLOCK_GROUP_METADATA;
+static const unsigned long long BCH_BTRFS_BLOCK_GROUP_PROFILE_MASK = BTRFS_BLOCK_GROUP_PROFILE_MASK;
+static const unsigned long long BCH_BTRFS_ROOT_ITEM_KEY = BTRFS_ROOT_ITEM_KEY;
+static const unsigned long long BCH_BTRFS_CHUNK_ITEM_KEY = BTRFS_CHUNK_ITEM_KEY;
+static const unsigned long long BCH_BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS = BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS;
+static const unsigned long long BCH_BTRFS_FEATURE_INCOMPAT_RAID56 = BTRFS_FEATURE_INCOMPAT_RAID56;
+static const unsigned long long BCH_BTRFS_FEATURE_INCOMPAT_RAID1C34 = BTRFS_FEATURE_INCOMPAT_RAID1C34;
+static const unsigned long long BCH_BTRFS_FEATURE_INCOMPAT_ZONED = BTRFS_FEATURE_INCOMPAT_ZONED;
+static const unsigned long long BCH_BTRFS_FEATURE_INCOMPAT_RAID_STRIPE_TREE = BTRFS_FEATURE_INCOMPAT_RAID_STRIPE_TREE;
+static const unsigned long long BCH_BTRFS_FEATURE_INCOMPAT_REMAP_TREE = BTRFS_FEATURE_INCOMPAT_REMAP_TREE;
+static const unsigned long long BCH_BTRFS_FEATURE_INCOMPAT_MIXED_BACKREF = BTRFS_FEATURE_INCOMPAT_MIXED_BACKREF;
+static const unsigned long long BCH_BTRFS_FEATURE_INCOMPAT_DEFAULT_SUBVOL = BTRFS_FEATURE_INCOMPAT_DEFAULT_SUBVOL;
+static const unsigned long long BCH_BTRFS_FEATURE_INCOMPAT_COMPRESS_LZO = BTRFS_FEATURE_INCOMPAT_COMPRESS_LZO;
+static const unsigned long long BCH_BTRFS_FEATURE_INCOMPAT_COMPRESS_ZSTD = BTRFS_FEATURE_INCOMPAT_COMPRESS_ZSTD;
+static const unsigned long long BCH_BTRFS_FEATURE_INCOMPAT_BIG_METADATA = BTRFS_FEATURE_INCOMPAT_BIG_METADATA;
+static const unsigned long long BCH_BTRFS_FEATURE_INCOMPAT_EXTENDED_IREF = BTRFS_FEATURE_INCOMPAT_EXTENDED_IREF;
+static const unsigned long long BCH_BTRFS_FEATURE_INCOMPAT_SKINNY_METADATA = BTRFS_FEATURE_INCOMPAT_SKINNY_METADATA;
+static const unsigned long long BCH_BTRFS_FEATURE_INCOMPAT_NO_HOLES = BTRFS_FEATURE_INCOMPAT_NO_HOLES;
+static const unsigned long long BCH_BTRFS_FEATURE_INCOMPAT_METADATA_UUID = BTRFS_FEATURE_INCOMPAT_METADATA_UUID;
+static const unsigned long long BCH_BTRFS_FEATURE_INCOMPAT_SIMPLE_QUOTA = BTRFS_FEATURE_INCOMPAT_SIMPLE_QUOTA;
+static const unsigned long long BCH_BTRFS_FEATURE_INCOMPAT_EXTENT_TREE_V2 = BTRFS_FEATURE_INCOMPAT_EXTENT_TREE_V2;
+
+/*
  * bcachefs's own ioctl numbers, for the same reason: the generated Rust
  * inventory used to compute these with a hand-written opcode(), which baked in
  * asm-generic's layout - dir at bit 30, 14 size bits - and so was wrong on
@@ -166,6 +213,9 @@ struct rust_journal_entries rust_collect_journal_entries(struct bch_fs *c);
  * can't be inlined through bindgen.
  */
 void rust_set_bit(unsigned long nr, unsigned long *addr);
+
+/* Count bucket bits excluded by buckets_nouse. */
+unsigned long rust_count_set_bits(const unsigned long *addr, unsigned long nbits);
 
 /*
  * Data IO shims — wraps static inlines not available through bindgen.

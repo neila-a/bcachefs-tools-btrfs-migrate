@@ -75,7 +75,12 @@ fn delete_test_keys(fs: &Fs) -> TestRet {
     )
 }
 
-fn insert_cookie(fs: &Fs, btree: c::btree_id, k: &mut BkeyCookie) -> TestRet {
+fn insert_cookie_with_flags(
+    fs: &Fs,
+    btree: c::btree_id,
+    k: &mut BkeyCookie,
+    iter_flags: BtreeIterFlags,
+) -> TestRet {
     /*
      * A cookie has no pointers, so nothing can charge trans->extra_disk_res
      * for it - but an extents leaf update is required to have somewhere to
@@ -88,8 +93,12 @@ fn insert_cookie(fs: &Fs, btree: c::btree_id, k: &mut BkeyCookie) -> TestRet {
         k,
         Some(&res),
         CommitOpts::new(),
-        BtreeIterFlags::empty(),
+        iter_flags,
     )
+}
+
+fn insert_cookie(fs: &Fs, btree: c::btree_id, k: &mut BkeyCookie) -> TestRet {
+    insert_cookie_with_flags(fs, btree, k, BtreeIterFlags::empty())
 }
 
 fn trans_cookie_alloc<'a, 't>(
@@ -657,6 +666,21 @@ fn seq_insert(fs: &Fs, nr: u64) -> TestRet {
     Ok(())
 }
 
+fn seq_insert_uncached(fs: &Fs, nr: u64) -> TestRet {
+    for i in 0..nr {
+        let mut insert = BkeyCookie::new();
+        insert.k_mut().p = spos(0, i, u32::MAX);
+        insert_cookie_with_flags(
+            fs,
+            c::btree_id::inodes,
+            &mut insert,
+            BtreeIterFlags::CACHED,
+        )?;
+    }
+
+    Ok(())
+}
+
 fn seq_lookup(fs: &Fs, _nr: u64) -> TestRet {
     let trans = BtreeTrans::new(fs);
     let mut iter = BtreeIter::new(&trans, c::btree_id::xattrs, spos(0, 0, u32::MAX), BtreeIterFlags::empty());
@@ -705,6 +729,7 @@ fn lookup_test(testname: &CStr) -> Option<(&'static [u8], TestFn)> {
         (b"rand_mixed", rand_mixed),
         (b"rand_delete", rand_delete),
         (b"seq_insert", seq_insert),
+        (b"seq_insert_uncached", seq_insert_uncached),
         (b"seq_lookup", seq_lookup),
         (b"seq_overwrite", seq_overwrite),
         (b"seq_delete", seq_delete),
@@ -729,7 +754,6 @@ fn lookup_test(testname: &CStr) -> Option<(&'static [u8], TestFn)> {
 
     TESTS.iter().copied().find(|(name, _)| testname.to_bytes() == *name)
 }
-
 struct TestJob {
     fs:         BorrowedFs,
     nr:         u64,
