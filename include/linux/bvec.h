@@ -42,6 +42,14 @@ struct bvec_iter {
 						   current bvec */
 };
 
+/*
+ * Kernel 7.3 renamed bvec_iter.bi_bvec_done to bi_offset. Shared fs/ code
+ * switches to the new name when LINUX_VERSION_CODE >= 7.3.0, so the userspace
+ * shim must expose both spellings regardless of the version reported by the
+ * host's <linux/version.h>.
+ */
+#define bi_offset bi_bvec_done
+
 struct bvec_iter_all {
 	int		idx;
 };
